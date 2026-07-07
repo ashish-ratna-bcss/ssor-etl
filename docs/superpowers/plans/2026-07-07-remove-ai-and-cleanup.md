@@ -9,7 +9,7 @@
 **Tech Stack:** Bash (`mv`, `grep`), Python 3 (`py_compile` for syntax verification).
 
 ## Global Constraints
-- No git repo exists at `/home/ashish-ratna/CCTNS-ETL` — every "commit" step in this plan is replaced with a verification step instead. If a repo gets initialized before this runs, switch back to real commits.
+- Git repo initialized at `/home/ashish-ratna/CCTNS-ETL` with baseline commit `4d23564`. Every task ends with a real `git commit`.
 - Do not touch `node_modules/` — third-party, unrelated to this migration.
 - Do not delete anything — every removal is a `mv` into `archive/`, reversible.
 - Reference design doc: `docs/superpowers/specs/2026-07-07-pure-raw-etl-supabase-design.md`.
