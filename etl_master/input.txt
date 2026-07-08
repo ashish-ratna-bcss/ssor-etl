@@ -103,3 +103,15 @@ update_file_extentions
 cd /data-drive/etl-process-dev/etl-files/update_file_urls_with_extensions
 source /data-drive/etl-process-dev/venv/bin/activate
 python3 update_file_urls_with_extensions.py
+
+[Order 16]
+stolen_automobiles
+cd /data-drive/etl-process-dev/etl-stolen-automobiles
+source /data-drive/etl-process-dev/venv/bin/activate
+python3 etl_stolen_automobiles.py
+
+[Order 17]
+fpb_accused
+cd /data-drive/etl-process-dev/etl-fpb-accused
+source /data-drive/etl-process-dev/venv/bin/activate
+python3 etl_fpb_accused.py
