@@ -31,8 +31,6 @@ REQUIRED_TABLES = [
     "accused",
     "persons",
     "hierarchy",
-    "brief_facts_ai",
-    "etl_crime_processing_log",
 ]
 
 
@@ -193,7 +191,7 @@ def validate_minimum_schema(connection) -> None:
         raise PreflightError(
             "Database schema is incomplete. Missing required public tables: "
             + ", ".join(missing)
-            + ". Apply DB-schema.sql and unified_brief_facts_etl.sql before running ETL."
+            + ". Apply DB-schema.sql before running ETL."
         )
 
 
