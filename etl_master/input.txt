@@ -11,6 +11,36 @@
 # 3. Separate the directory and the command with a semicolon (;).
 # 4. Lines starting with # are ignored.
 #
+# --- Ordering rationale (verified against each ETL's actual DB checks, not
+# just comments -- see etl_master's dependency audit) ---
+#   1  hierarchy    : no dependencies.
+#   2  crimes       : hard-depends on hierarchy (PS_CODE validated against it).
+#   3  accused      : hard-depends on crimes; soft-creates person stub rows.
+#   4  persons      : depends on accused (backfills the stub rows accused just
+#                      created -- not a hard gate, but a worklist source, so it
+#                      must run after accused to have anything to enrich).
+#   5-9  properties, IR, Disposal, arrests, mo_seizures : each only
+#                      hard-depends on crimes; independent of each other.
+#  10  stolen_automobiles : hard-depends on crimes only -- same tier as 5-9.
+#  11  fpb_accused  : hard-depends on crimes only (reads FIR_NUM/PS_CODE
+#                      straight from the crimes table to drive its lookups).
+#  12  fsl_case_property : soft-depends on mo_seizures (its MO-match audit
+#                      check) -- placed right after mo_seizures/stolen/fpb
+#                      instead of trailing chargesheets like before.
+#  13  chargesheets : hard-depends on crimes only.
+#  14  updated_chargesheet : logically follows chargesheets (same document,
+#                      later revision) -- both hard-depend on crimes.
+#  15  update_file_id : depends on persons (its persons-branch worklist reads
+#                      `SELECT DISTINCT person_id FROM persons`) -- persons
+#                      already ran at step 4, so this is satisfied regardless
+#                      of where it sits after that; kept last among data
+#                      ETLs since it also mirrors file references created by
+#                      every other data type above.
+#  16  files_download_media_server : hard-depends on update_file_id having
+#                      populated the files table.
+#  17  update_file_extentions : hard-depends on files_download_media_server
+#                      having actually downloaded files (needs real file_path).
+#
 
 # --- User Process Definitions ---
 
@@ -69,16 +99,16 @@ source /data-drive/etl-process-dev/venv/bin/activate
 python3 etl_mo_seizure.py
 
 [Order 10]
-chargesheets
-cd /data-drive/etl-process-dev/etl_chargesheets
+stolen_automobiles
+cd /data-drive/etl-process-dev/etl-stolen-automobiles
 source /data-drive/etl-process-dev/venv/bin/activate
-python3 etl_chargesheets.py
+python3 etl_stolen_automobiles.py
 
 [Order 11]
-updated_chargesheet
-cd /data-drive/etl-process-dev/etl_updated_chargesheet
+fpb_accused
+cd /data-drive/etl-process-dev/etl-fpb-accused
 source /data-drive/etl-process-dev/venv/bin/activate
-python3 etl_update_chargesheet.py
+python3 etl_fpb_accused.py
 
 [Order 12]
 fsl_case_property
@@ -87,31 +117,31 @@ source /data-drive/etl-process-dev/venv/bin/activate
 python3 etl_fsl_case_property.py
 
 [Order 13]
+chargesheets
+cd /data-drive/etl-process-dev/etl_chargesheets
+source /data-drive/etl-process-dev/venv/bin/activate
+python3 etl_chargesheets.py
+
+[Order 14]
+updated_chargesheet
+cd /data-drive/etl-process-dev/etl_updated_chargesheet
+source /data-drive/etl-process-dev/venv/bin/activate
+python3 etl_update_chargesheet.py
+
+[Order 15]
 update_file_id
 cd /data-drive/etl-process-dev/etl-files/etl_pipeline_files
 source /data-drive/etl-process-dev/venv/bin/activate
 python3 main_standalone.py
 
-[Order 14]
+[Order 16]
 files_download_media_server
 cd /data-drive/etl-process-dev/etl-files/etl_files_media_server
 source /data-drive/etl-process-dev/venv/bin/activate
 python3 -m etl_files_media_server.main
 
-[Order 15]
+[Order 17]
 update_file_extentions
 cd /data-drive/etl-process-dev/etl-files/update_file_urls_with_extensions
 source /data-drive/etl-process-dev/venv/bin/activate
 python3 update_file_urls_with_extensions.py
-
-[Order 16]
-stolen_automobiles
-cd /data-drive/etl-process-dev/etl-stolen-automobiles
-source /data-drive/etl-process-dev/venv/bin/activate
-python3 etl_stolen_automobiles.py
-
-[Order 17]
-fpb_accused
-cd /data-drive/etl-process-dev/etl-fpb-accused
-source /data-drive/etl-process-dev/venv/bin/activate
-python3 etl_fpb_accused.py
