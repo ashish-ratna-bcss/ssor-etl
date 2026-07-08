@@ -696,22 +696,6 @@ class PersonsETL:
             'JURISDICTION_PS': 'present_jurisdiction_ps'
         }
         
-        # Permanent Address mapping
-        permanent_address_fields = {
-            'HOUSE_NO': 'permanent_house_no',
-            'STREET_ROAD_NO': 'permanent_street_road_no',
-            'WARD_COLONY': 'permanent_ward_colony',
-            'LANDMARK_MILESTONE': 'permanent_landmark_milestone',
-            'LOCALITY_VILLAGE': 'permanent_locality_village',
-            'AREA_MANDAL': 'permanent_area_mandal',
-            'DISTRICT': 'permanent_district',
-            'STATE_UT': 'permanent_state_ut',
-            'COUNTRY': 'permanent_country',
-            'RESIDENCY_TYPE': 'permanent_residency_type',
-            'PIN_CODE': 'permanent_pin_code',
-            'JURISDICTION_PS': 'permanent_jurisdiction_ps'
-        }
-        
         # Contact Details mapping
         contact_fields = {
             'PHONE_NUMBER': 'phone_number',
@@ -744,13 +728,6 @@ class PersonsETL:
             for api_field, db_column in present_address_fields.items():
                 if api_field in present and db_column not in table_columns:
                     new_fields[f'PRESENT_ADDRESS.{api_field}'] = db_column
-        
-        # Check Permanent Address
-        permanent = api_record.get('PERMANENT_ADDRESS', {})
-        if isinstance(permanent, dict):
-            for api_field, db_column in permanent_address_fields.items():
-                if api_field in permanent and db_column not in table_columns:
-                    new_fields[f'PERMANENT_ADDRESS.{api_field}'] = db_column
         
         # Check Contact Details
         contact = api_record.get('CONTACT_DETAILS', {})
@@ -975,8 +952,8 @@ class PersonsETL:
         except Exception as e:
             logger.error(f"❌ Error updating existing records: {e}")
     
-    def update_new_fields(self, person_id: str, p: Dict, personal: Dict, present: Dict, 
-                         permanent: Dict, contact: Dict, table_columns: Set[str], cursor):
+    def update_new_fields(self, person_id: str, p: Dict, personal: Dict, present: Dict,
+                         contact: Dict, table_columns: Set[str], cursor):
         """
         Update any new fields that were added via schema evolution.
         This handles fields that exist in table_columns but are not in the standard field list.
@@ -994,10 +971,6 @@ class PersonsETL:
             'present_landmark_milestone', 'present_locality_village', 'present_area_mandal',
             'present_district', 'present_state_ut', 'present_country', 'present_residency_type',
             'present_pin_code', 'present_jurisdiction_ps',
-            'permanent_house_no', 'permanent_street_road_no', 'permanent_ward_colony',
-            'permanent_landmark_milestone', 'permanent_locality_village', 'permanent_area_mandal',
-            'permanent_district', 'permanent_state_ut', 'permanent_country', 'permanent_residency_type',
-            'permanent_pin_code', 'permanent_jurisdiction_ps',
             'phone_number', 'phone_numbers', 'country_code', 'email_id', 'date_created', 'date_modified'
         }
         
@@ -1062,25 +1035,6 @@ class PersonsETL:
         for api_field, db_column in present_mapping.items():
             if db_column in table_columns and db_column not in standard_fields:
                 value = present.get(api_field)
-                if 'pin_code' in db_column or 'jurisdiction_ps' in db_column:
-                    value = self.truncate_string(value, 20, db_column)
-                else:
-                    value = self.truncate_string(value, 255, db_column)
-                new_fields_to_update[db_column] = value
-        
-        # Permanent address fields
-        permanent_mapping = {
-            'HOUSE_NO': 'permanent_house_no', 'STREET_ROAD_NO': 'permanent_street_road_no',
-            'WARD_COLONY': 'permanent_ward_colony', 'LANDMARK_MILESTONE': 'permanent_landmark_milestone',
-            'LOCALITY_VILLAGE': 'permanent_locality_village', 'AREA_MANDAL': 'permanent_area_mandal',
-            'DISTRICT': 'permanent_district', 'STATE_UT': 'permanent_state_ut', 'COUNTRY': 'permanent_country',
-            'RESIDENCY_TYPE': 'permanent_residency_type', 'PIN_CODE': 'permanent_pin_code',
-            'JURISDICTION_PS': 'permanent_jurisdiction_ps'
-        }
-        
-        for api_field, db_column in permanent_mapping.items():
-            if db_column in table_columns and db_column not in standard_fields:
-                value = permanent.get(api_field)
                 if 'pin_code' in db_column or 'jurisdiction_ps' in db_column:
                     value = self.truncate_string(value, 20, db_column)
                 else:
@@ -1457,7 +1411,6 @@ class PersonsETL:
         p = d or {}
         personal = p.get('PERSONAL_DETAILS') or {}
         present = p.get('PRESENT_ADDRESS') or {}
-        permanent = p.get('PERMANENT_ADDRESS') or {}
         contact = p.get('CONTACT_DETAILS') or {}
         
         # Store person_id for truncation logging
@@ -1570,34 +1523,6 @@ class PersonsETL:
                         present_residency_type=COALESCE(%s, present_residency_type),
                         present_pin_code=COALESCE(%s, present_pin_code),
                         present_jurisdiction_ps=COALESCE(%s, present_jurisdiction_ps),
-                        permanent_house_no=COALESCE(%s, permanent_house_no),
-                        permanent_street_road_no=COALESCE(%s, permanent_street_road_no),
-                        permanent_ward_colony=COALESCE(%s, permanent_ward_colony),
-                        permanent_landmark_milestone=COALESCE(%s, permanent_landmark_milestone),
-                        permanent_locality_village=COALESCE(%s, permanent_locality_village),
-                        permanent_area_mandal=CASE
-                            WHEN NULLIF(TRIM(permanent_area_mandal), '') IS NULL
-                                THEN COALESCE(NULLIF(TRIM(%s), ''), permanent_area_mandal)
-                            ELSE permanent_area_mandal
-                        END,
-                        permanent_district=CASE
-                            WHEN NULLIF(TRIM(permanent_district), '') IS NULL
-                                THEN COALESCE(NULLIF(TRIM(%s), ''), permanent_district)
-                            ELSE permanent_district
-                        END,
-                        permanent_state_ut=CASE
-                            WHEN NULLIF(TRIM(permanent_state_ut), '') IS NULL
-                                THEN COALESCE(NULLIF(TRIM(%s), ''), permanent_state_ut)
-                            ELSE permanent_state_ut
-                        END,
-                        permanent_country=CASE
-                            WHEN NULLIF(TRIM(permanent_country), '') IS NULL
-                                THEN COALESCE(NULLIF(TRIM(%s), ''), permanent_country)
-                            ELSE permanent_country
-                        END,
-                        permanent_residency_type=COALESCE(%s, permanent_residency_type),
-                        permanent_pin_code=COALESCE(%s, permanent_pin_code),
-                        permanent_jurisdiction_ps=COALESCE(%s, permanent_jurisdiction_ps),
                         phone_number=COALESCE(%s, phone_number),
                         country_code=COALESCE(%s, country_code),
                         email_id=COALESCE(%s, email_id),
@@ -1635,18 +1560,6 @@ class PersonsETL:
                         self.truncate_string(present.get('RESIDENCY_TYPE'), 100, 'present_residency_type'),
                         self.truncate_string(present.get('PIN_CODE'), 20, 'present_pin_code'),
                         self.truncate_string(present.get('JURISDICTION_PS'), 20, 'present_jurisdiction_ps'),
-                        self.truncate_string(permanent.get('HOUSE_NO'), 255, 'permanent_house_no'),
-                        self.truncate_string(permanent.get('STREET_ROAD_NO'), 255, 'permanent_street_road_no'),
-                        self.truncate_string(permanent.get('WARD_COLONY'), 255, 'permanent_ward_colony'),
-                        self.truncate_string(permanent.get('LANDMARK_MILESTONE'), 255, 'permanent_landmark_milestone'),
-                        self.truncate_string(permanent.get('LOCALITY_VILLAGE'), 255, 'permanent_locality_village'),
-                        self.truncate_string(permanent.get('AREA_MANDAL'), 255, 'permanent_area_mandal'),
-                        self.truncate_string(permanent.get('DISTRICT'), 255, 'permanent_district'),
-                        self.truncate_string(permanent.get('STATE_UT'), 255, 'permanent_state_ut'),
-                        self.truncate_string(permanent.get('COUNTRY'), 255, 'permanent_country'),
-                        self.truncate_string(permanent.get('RESIDENCY_TYPE'), 100, 'permanent_residency_type'),
-                        self.truncate_string(permanent.get('PIN_CODE'), 20, 'permanent_pin_code'),
-                        self.truncate_string(permanent.get('JURISDICTION_PS'), 20, 'permanent_jurisdiction_ps'),
                         primary_phone,
                         self.truncate_string(contact.get('COUNTRY_CODE'), 10, 'country_code'),
                         self.truncate_string(contact.get('EMAIL_ID'), 255, 'email_id'),
@@ -1669,7 +1582,7 @@ class PersonsETL:
                 
                 # Update any new fields that were added via schema evolution
                 if table_columns:
-                    self.update_new_fields(person_id, p, personal, present, permanent, contact, table_columns, cursor)
+                    self.update_new_fields(person_id, p, personal, present, contact, table_columns, cursor)
             else:
                 cursor.execute(
                     f"""
@@ -1683,10 +1596,6 @@ class PersonsETL:
                         present_landmark_milestone, present_locality_village, present_area_mandal,
                         present_district, present_state_ut, present_country, present_residency_type,
                         present_pin_code, present_jurisdiction_ps,
-                        permanent_house_no, permanent_street_road_no, permanent_ward_colony,
-                        permanent_landmark_milestone, permanent_locality_village, permanent_area_mandal,
-                        permanent_district, permanent_state_ut, permanent_country, permanent_residency_type,
-                        permanent_pin_code, permanent_jurisdiction_ps,
                         phone_number, country_code, email_id,
                         date_created, date_modified
                     ) VALUES (
@@ -1738,18 +1647,6 @@ class PersonsETL:
                         self.truncate_string(present.get('RESIDENCY_TYPE'), 100, 'present_residency_type'),
                         self.truncate_string(present.get('PIN_CODE'), 20, 'present_pin_code'),
                         self.truncate_string(present.get('JURISDICTION_PS'), 20, 'present_jurisdiction_ps'),
-                        self.truncate_string(permanent.get('HOUSE_NO'), 255, 'permanent_house_no'),
-                        self.truncate_string(permanent.get('STREET_ROAD_NO'), 255, 'permanent_street_road_no'),
-                        self.truncate_string(permanent.get('WARD_COLONY'), 255, 'permanent_ward_colony'),
-                        self.truncate_string(permanent.get('LANDMARK_MILESTONE'), 255, 'permanent_landmark_milestone'),
-                        self.truncate_string(permanent.get('LOCALITY_VILLAGE'), 255, 'permanent_locality_village'),
-                        self.truncate_string(permanent.get('AREA_MANDAL'), 255, 'permanent_area_mandal'),
-                        self.truncate_string(permanent.get('DISTRICT'), 255, 'permanent_district'),
-                        self.truncate_string(permanent.get('STATE_UT'), 255, 'permanent_state_ut'),
-                        self.truncate_string(permanent.get('COUNTRY'), 255, 'permanent_country'),
-                        self.truncate_string(permanent.get('RESIDENCY_TYPE'), 100, 'permanent_residency_type'),
-                        self.truncate_string(permanent.get('PIN_CODE'), 20, 'permanent_pin_code'),
-                        self.truncate_string(permanent.get('JURISDICTION_PS'), 20, 'permanent_jurisdiction_ps'),
                         primary_phone,
                         self.truncate_string(contact.get('COUNTRY_CODE'), 10, 'country_code'),
                         self.truncate_string(contact.get('EMAIL_ID'), 255, 'email_id'),
@@ -1772,7 +1669,7 @@ class PersonsETL:
                 # Update any new fields that were added via schema evolution (for new inserts, new fields will be NULL initially)
                 # They'll be updated when the person is reprocessed in future runs
                 if table_columns:
-                    self.update_new_fields(person_id, p, personal, present, permanent, contact, table_columns, cursor)
+                    self.update_new_fields(person_id, p, personal, present, contact, table_columns, cursor)
 
             conn.commit()
         except Exception as e:

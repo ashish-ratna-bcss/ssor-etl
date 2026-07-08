@@ -497,14 +497,20 @@ class CrimesETL:
             'CRIME_ID', 'PS_CODE', 'FIR_NUM', 'FIR_REG_NUM', 'FIR_TYPE',
             'ACTS_SECTIONS', 'FIR_DATE', 'CASE_STATUS', 'MAJOR_HEAD', 'MINOR_HEAD',
             'CRIME_TYPE', 'IO_NAME', 'IO_RANK', 'BRIEF_FACTS', 'FIR_COPY',
-            'DATE_CREATED', 'DATE_MODIFIED'
+            'DATE_CREATED', 'DATE_MODIFIED',
+            'COMPLAINANT_ID', 'COURT_NAME', 'IO_MOBILE', 'GD', 'OCCURRENCE_DATE',
+            'PLACE_OF_OFFENCE',
         }
 
         # 2. Automatically grab everything else (ignoring nulls)
         additional_data = {
-            k: v for k, v in crime_raw.items() 
+            k: v for k, v in crime_raw.items()
             if k not in known_keys and v is not None
         }
+
+        gd = crime_raw.get('GD') or {}
+        occurrence_date = crime_raw.get('OCCURRENCE_DATE') or {}
+        place_of_offence = crime_raw.get('PLACE_OF_OFFENCE') or {}
 
         # 3. Build the standard dictionary
         transformed = {
@@ -523,10 +529,32 @@ class CrimesETL:
             'io_rank': crime_raw.get('IO_RANK'),
             'brief_facts': crime_raw.get('BRIEF_FACTS'),
             'fir_copy': crime_raw.get('FIR_COPY'),
-            
+            'complainant_id': crime_raw.get('COMPLAINANT_ID'),
+            'court_name': crime_raw.get('COURT_NAME'),
+            'io_mobile': crime_raw.get('IO_MOBILE'),
+            'gd_entry_date': gd.get('ENTRY_DATE'),
+            'gd_entry_num': gd.get('ENTRY_NUM'),
+            'gd_entry_type': gd.get('ENTRY_TYPE'),
+            'occurrence_from_date': occurrence_date.get('FROM_DATE'),
+            'occurrence_prior_to_date': occurrence_date.get('PRIOR_TO_DATE'),
+            'occurrence_to_date': occurrence_date.get('TO_DATE'),
+            'poo_area_mandal': place_of_offence.get('AREA_MANDAL'),
+            'poo_beat_no': place_of_offence.get('BEAT_NO'),
+            'poo_district': place_of_offence.get('DISTRICT'),
+            'poo_house_no': place_of_offence.get('HOUSE_NO'),
+            'poo_jurisdiction_ps': place_of_offence.get('JURISDICTION_PS'),
+            'poo_landmark_milestone': place_of_offence.get('LANDMARK_MILESTONE'),
+            'poo_latitude': place_of_offence.get('LATITUDE'),
+            'poo_limits': place_of_offence.get('LIMITS'),
+            'poo_longitude': place_of_offence.get('LONGITUDE'),
+            'poo_pin_code': place_of_offence.get('PIN_CODE'),
+            'poo_state_ut': place_of_offence.get('STATE_UT'),
+            'poo_street_road_no': place_of_offence.get('STREET_ROAD_NO'),
+            'poo_ward_colony': place_of_offence.get('WARD_COLONY'),
+
             # Using your exact requested logic here (it remains a pure dict)
             'additional_json_data': additional_data if additional_data else None,
-            
+
             'date_created': crime_raw.get('DATE_CREATED'),
             'date_modified': crime_raw.get('DATE_MODIFIED')
         }
@@ -548,6 +576,12 @@ class CrimesETL:
             SELECT crime_id, ps_code, fir_num, fir_reg_num, fir_type,
                    acts_sections, fir_date, case_status, major_head, minor_head,
                    crime_type, io_name, io_rank, brief_facts, fir_copy,
+                   complainant_id, court_name, io_mobile,
+                   gd_entry_date, gd_entry_num, gd_entry_type,
+                   occurrence_from_date, occurrence_prior_to_date, occurrence_to_date,
+                   poo_area_mandal, poo_beat_no, poo_district, poo_house_no,
+                   poo_jurisdiction_ps, poo_landmark_milestone, poo_latitude, poo_limits,
+                   poo_longitude, poo_pin_code, poo_state_ut, poo_street_road_no, poo_ward_colony,
                    additional_json_data,
                    date_created, date_modified
             FROM {CRIMES_TABLE}
@@ -572,9 +606,31 @@ class CrimesETL:
                 'io_rank': row[12],
                 'brief_facts': row[13],
                 'fir_copy': row[14],
-                'additional_json_data': row[15],
-                'date_created': row[16],
-                'date_modified': row[17]
+                'complainant_id': row[15],
+                'court_name': row[16],
+                'io_mobile': row[17],
+                'gd_entry_date': row[18],
+                'gd_entry_num': row[19],
+                'gd_entry_type': row[20],
+                'occurrence_from_date': row[21],
+                'occurrence_prior_to_date': row[22],
+                'occurrence_to_date': row[23],
+                'poo_area_mandal': row[24],
+                'poo_beat_no': row[25],
+                'poo_district': row[26],
+                'poo_house_no': row[27],
+                'poo_jurisdiction_ps': row[28],
+                'poo_landmark_milestone': row[29],
+                'poo_latitude': row[30],
+                'poo_limits': row[31],
+                'poo_longitude': row[32],
+                'poo_pin_code': row[33],
+                'poo_state_ut': row[34],
+                'poo_street_road_no': row[35],
+                'poo_ward_colony': row[36],
+                'additional_json_data': row[37],
+                'date_created': row[38],
+                'date_modified': row[39]
             }
         return None
     
@@ -679,8 +735,18 @@ class CrimesETL:
                     crime_id, ps_code, fir_num, fir_reg_num, fir_type,
                     acts_sections, fir_date, case_status, major_head, minor_head,
                     crime_type, io_name, io_rank, brief_facts, fir_copy,
+                    complainant_id, court_name, io_mobile,
+                    gd_entry_date, gd_entry_num, gd_entry_type,
+                    occurrence_from_date, occurrence_prior_to_date, occurrence_to_date,
+                    poo_area_mandal, poo_beat_no, poo_district, poo_house_no,
+                    poo_jurisdiction_ps, poo_landmark_milestone, poo_latitude, poo_limits,
+                    poo_longitude, poo_pin_code, poo_state_ut, poo_street_road_no, poo_ward_colony,
                     additional_json_data, date_created, date_modified
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
                 ON CONFLICT (crime_id) DO UPDATE SET
                     ps_code = EXCLUDED.ps_code,
                     fir_num = EXCLUDED.fir_num,
@@ -696,6 +762,28 @@ class CrimesETL:
                     io_rank = EXCLUDED.io_rank,
                     brief_facts = EXCLUDED.brief_facts,
                     fir_copy = EXCLUDED.fir_copy,
+                    complainant_id = EXCLUDED.complainant_id,
+                    court_name = EXCLUDED.court_name,
+                    io_mobile = EXCLUDED.io_mobile,
+                    gd_entry_date = EXCLUDED.gd_entry_date,
+                    gd_entry_num = EXCLUDED.gd_entry_num,
+                    gd_entry_type = EXCLUDED.gd_entry_type,
+                    occurrence_from_date = EXCLUDED.occurrence_from_date,
+                    occurrence_prior_to_date = EXCLUDED.occurrence_prior_to_date,
+                    occurrence_to_date = EXCLUDED.occurrence_to_date,
+                    poo_area_mandal = EXCLUDED.poo_area_mandal,
+                    poo_beat_no = EXCLUDED.poo_beat_no,
+                    poo_district = EXCLUDED.poo_district,
+                    poo_house_no = EXCLUDED.poo_house_no,
+                    poo_jurisdiction_ps = EXCLUDED.poo_jurisdiction_ps,
+                    poo_landmark_milestone = EXCLUDED.poo_landmark_milestone,
+                    poo_latitude = EXCLUDED.poo_latitude,
+                    poo_limits = EXCLUDED.poo_limits,
+                    poo_longitude = EXCLUDED.poo_longitude,
+                    poo_pin_code = EXCLUDED.poo_pin_code,
+                    poo_state_ut = EXCLUDED.poo_state_ut,
+                    poo_street_road_no = EXCLUDED.poo_street_road_no,
+                    poo_ward_colony = EXCLUDED.poo_ward_colony,
                     additional_json_data = EXCLUDED.additional_json_data,
                     date_modified = EXCLUDED.date_modified
                 WHERE (
@@ -713,16 +801,45 @@ class CrimesETL:
                     {CRIMES_TABLE}.io_rank IS DISTINCT FROM EXCLUDED.io_rank OR
                     {CRIMES_TABLE}.brief_facts IS DISTINCT FROM EXCLUDED.brief_facts OR
                     {CRIMES_TABLE}.fir_copy IS DISTINCT FROM EXCLUDED.fir_copy OR
+                    {CRIMES_TABLE}.complainant_id IS DISTINCT FROM EXCLUDED.complainant_id OR
+                    {CRIMES_TABLE}.court_name IS DISTINCT FROM EXCLUDED.court_name OR
+                    {CRIMES_TABLE}.io_mobile IS DISTINCT FROM EXCLUDED.io_mobile OR
+                    {CRIMES_TABLE}.gd_entry_date IS DISTINCT FROM EXCLUDED.gd_entry_date OR
+                    {CRIMES_TABLE}.gd_entry_num IS DISTINCT FROM EXCLUDED.gd_entry_num OR
+                    {CRIMES_TABLE}.gd_entry_type IS DISTINCT FROM EXCLUDED.gd_entry_type OR
+                    {CRIMES_TABLE}.occurrence_from_date IS DISTINCT FROM EXCLUDED.occurrence_from_date OR
+                    {CRIMES_TABLE}.occurrence_prior_to_date IS DISTINCT FROM EXCLUDED.occurrence_prior_to_date OR
+                    {CRIMES_TABLE}.occurrence_to_date IS DISTINCT FROM EXCLUDED.occurrence_to_date OR
+                    {CRIMES_TABLE}.poo_area_mandal IS DISTINCT FROM EXCLUDED.poo_area_mandal OR
+                    {CRIMES_TABLE}.poo_beat_no IS DISTINCT FROM EXCLUDED.poo_beat_no OR
+                    {CRIMES_TABLE}.poo_district IS DISTINCT FROM EXCLUDED.poo_district OR
+                    {CRIMES_TABLE}.poo_house_no IS DISTINCT FROM EXCLUDED.poo_house_no OR
+                    {CRIMES_TABLE}.poo_jurisdiction_ps IS DISTINCT FROM EXCLUDED.poo_jurisdiction_ps OR
+                    {CRIMES_TABLE}.poo_landmark_milestone IS DISTINCT FROM EXCLUDED.poo_landmark_milestone OR
+                    {CRIMES_TABLE}.poo_latitude IS DISTINCT FROM EXCLUDED.poo_latitude OR
+                    {CRIMES_TABLE}.poo_limits IS DISTINCT FROM EXCLUDED.poo_limits OR
+                    {CRIMES_TABLE}.poo_longitude IS DISTINCT FROM EXCLUDED.poo_longitude OR
+                    {CRIMES_TABLE}.poo_pin_code IS DISTINCT FROM EXCLUDED.poo_pin_code OR
+                    {CRIMES_TABLE}.poo_state_ut IS DISTINCT FROM EXCLUDED.poo_state_ut OR
+                    {CRIMES_TABLE}.poo_street_road_no IS DISTINCT FROM EXCLUDED.poo_street_road_no OR
+                    {CRIMES_TABLE}.poo_ward_colony IS DISTINCT FROM EXCLUDED.poo_ward_colony OR
                     {CRIMES_TABLE}.additional_json_data IS DISTINCT FROM EXCLUDED.additional_json_data
                 )
             """
-            
+
             cursor.execute(upsert_query, (
                 crime['crime_id'], crime['ps_code'], crime['fir_num'],
                 crime['fir_reg_num'], crime['fir_type'], crime['acts_sections'],
                 crime['fir_date'], crime['case_status'], crime['major_head'],
                 crime['minor_head'], crime['crime_type'], crime['io_name'],
                 crime['io_rank'], crime['brief_facts'], crime['fir_copy'],
+                crime['complainant_id'], crime['court_name'], crime['io_mobile'],
+                crime['gd_entry_date'], crime['gd_entry_num'], crime['gd_entry_type'],
+                crime['occurrence_from_date'], crime['occurrence_prior_to_date'], crime['occurrence_to_date'],
+                crime['poo_area_mandal'], crime['poo_beat_no'], crime['poo_district'], crime['poo_house_no'],
+                crime['poo_jurisdiction_ps'], crime['poo_landmark_milestone'], crime['poo_latitude'], crime['poo_limits'],
+                crime['poo_longitude'], crime['poo_pin_code'], crime['poo_state_ut'], crime['poo_street_road_no'],
+                crime['poo_ward_colony'],
                 Json(crime['additional_json_data']) if crime['additional_json_data'] else None,
                 crime['date_created'], crime['date_modified']
             ))
@@ -750,6 +867,28 @@ class CrimesETL:
                         ('io_rank', 'io_rank'),
                         ('brief_facts', 'brief_facts'),
                         ('fir_copy', 'fir_copy'),
+                        ('complainant_id', 'complainant_id'),
+                        ('court_name', 'court_name'),
+                        ('io_mobile', 'io_mobile'),
+                        ('gd_entry_date', 'gd_entry_date'),
+                        ('gd_entry_num', 'gd_entry_num'),
+                        ('gd_entry_type', 'gd_entry_type'),
+                        ('occurrence_from_date', 'occurrence_from_date'),
+                        ('occurrence_prior_to_date', 'occurrence_prior_to_date'),
+                        ('occurrence_to_date', 'occurrence_to_date'),
+                        ('poo_area_mandal', 'poo_area_mandal'),
+                        ('poo_beat_no', 'poo_beat_no'),
+                        ('poo_district', 'poo_district'),
+                        ('poo_house_no', 'poo_house_no'),
+                        ('poo_jurisdiction_ps', 'poo_jurisdiction_ps'),
+                        ('poo_landmark_milestone', 'poo_landmark_milestone'),
+                        ('poo_latitude', 'poo_latitude'),
+                        ('poo_limits', 'poo_limits'),
+                        ('poo_longitude', 'poo_longitude'),
+                        ('poo_pin_code', 'poo_pin_code'),
+                        ('poo_state_ut', 'poo_state_ut'),
+                        ('poo_street_road_no', 'poo_street_road_no'),
+                        ('poo_ward_colony', 'poo_ward_colony'),
                         ('additional_json_data', 'additional_json_data')
                     ]
                     for crime_key, db_key in fields_to_check:

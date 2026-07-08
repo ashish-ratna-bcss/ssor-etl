@@ -515,6 +515,28 @@ CREATE TABLE public.crimes (
     date_created timestamp without time zone,
     date_modified timestamp without time zone,
     fir_copy character varying(50),
+    complainant_id character varying(50),
+    court_name character varying(255),
+    io_mobile character varying(20),
+    gd_entry_date timestamp without time zone,
+    gd_entry_num character varying(50),
+    gd_entry_type character varying(50),
+    occurrence_from_date timestamp without time zone,
+    occurrence_prior_to_date timestamp without time zone,
+    occurrence_to_date timestamp without time zone,
+    poo_area_mandal character varying(255),
+    poo_beat_no character varying(50),
+    poo_district character varying(100),
+    poo_house_no character varying(100),
+    poo_jurisdiction_ps character varying(255),
+    poo_landmark_milestone character varying(255),
+    poo_latitude character varying(50),
+    poo_limits character varying(255),
+    poo_longitude character varying(50),
+    poo_pin_code character varying(20),
+    poo_state_ut character varying(100),
+    poo_street_road_no character varying(255),
+    poo_ward_colony character varying(255),
     additional_json_data jsonb
 );
 
@@ -633,18 +655,6 @@ CREATE TABLE public.persons (
     present_residency_type character varying(100),
     present_pin_code character varying(20),
     present_jurisdiction_ps character varying(20),
-    permanent_house_no character varying(255),
-    permanent_street_road_no character varying(255),
-    permanent_ward_colony character varying(255),
-    permanent_landmark_milestone character varying(255),
-    permanent_locality_village character varying(255),
-    permanent_area_mandal character varying(255),
-    permanent_district character varying(255),
-    permanent_state_ut character varying(255),
-    permanent_country character varying(255),
-    permanent_residency_type character varying(100),
-    permanent_pin_code character varying(20),
-    permanent_jurisdiction_ps character varying(20),
     phone_number character varying(20),
     country_code character varying(10),
     email_id character varying(255),
@@ -3407,6 +3417,8 @@ CREATE TABLE public.mo_seizure_media (
     media_file_id text,
     media_url text,
     media_name text,
+    media_category text,
+    media_type text,
     date_created timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     date_modified timestamp with time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
@@ -3467,6 +3479,8 @@ CREATE TABLE public.mo_seizures (
     mo_media_url text,
     mo_media_name text,
     mo_media_file_id text,
+    mo_media_category text,
+    mo_media_type text,
     date_created timestamp with time zone,
     date_modified timestamp with time zone
 );
@@ -4316,13 +4330,6 @@ CREATE UNIQUE INDEX idx_pending_fk_ir_id ON public.ir_pending_fk USING btree (ir
 
 CREATE UNIQUE INDEX idx_pending_fk_property_id ON public.properties_pending_fk USING btree (property_id) WHERE (NOT resolved);
 
-
---
--- TOC entry 4135 (class 1259 OID 40940066)
--- Name: idx_persons_address_pending; Type: INDEX; Schema: public; Owner: dev_dopamas
---
-
-CREATE INDEX idx_persons_address_pending ON public.persons USING btree (person_id) WHERE (((TRIM(BOTH FROM COALESCE(permanent_state_ut, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(present_state_ut, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(permanent_district, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(present_district, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(permanent_area_mandal, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(present_area_mandal, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(permanent_locality_village, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(present_locality_village, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(permanent_landmark_milestone, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(present_landmark_milestone, ''::character varying)) <> ''::text) OR (TRIM(BOTH FROM COALESCE(nationality, ''::character varying)) <> ''::text)) AND (NOT ((TRIM(BOTH FROM COALESCE(permanent_country, ''::character varying)) <> ''::text) AND (TRIM(BOTH FROM COALESCE(permanent_state_ut, ''::character varying)) <> ''::text) AND (TRIM(BOTH FROM COALESCE(permanent_district, ''::character varying)) <> ''::text))));
 
 
 --

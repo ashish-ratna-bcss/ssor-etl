@@ -715,19 +715,23 @@ class MoSeizureETL:
         file_ids = as_list(seizure_raw.get('MO_MEDIA_FILE_ID'))
         media_urls = as_list(seizure_raw.get('MO_MEDIA_URL'))
         media_names = as_list(seizure_raw.get('MO_MEDIA_NAME'))
+        media_categories = as_list(seizure_raw.get('MO_MEDIA_CATEGORY'))
+        media_types = as_list(seizure_raw.get('MO_MEDIA_TYPE'))
 
-        if not any(item is not None for item in file_ids + media_urls + media_names):
+        if not any(item is not None for item in file_ids + media_urls + media_names + media_categories + media_types):
             return []
 
-        entry_count = max(len(file_ids), len(media_urls), len(media_names))
+        entry_count = max(len(file_ids), len(media_urls), len(media_names), len(media_categories), len(media_types))
         media_entries = []
 
         for index in range(entry_count):
             media_file_id = file_ids[index] if index < len(file_ids) else (file_ids[-1] if file_ids else None)
             media_url = media_urls[index] if index < len(media_urls) else (media_urls[-1] if media_urls else None)
             media_name = media_names[index] if index < len(media_names) else (media_names[-1] if media_names else None)
+            media_category = media_categories[index] if index < len(media_categories) else (media_categories[-1] if media_categories else None)
+            media_type = media_types[index] if index < len(media_types) else (media_types[-1] if media_types else None)
 
-            if media_file_id is None and media_url is None and media_name is None:
+            if media_file_id is None and media_url is None and media_name is None and media_category is None and media_type is None:
                 continue
 
             media_entries.append({
@@ -735,6 +739,8 @@ class MoSeizureETL:
                 'media_file_id': media_file_id,
                 'media_url': media_url,
                 'media_name': media_name,
+                'media_category': media_category,
+                'media_type': media_type,
             })
 
         return media_entries
@@ -748,6 +754,8 @@ class MoSeizureETL:
             'media_file_id': None,
             'media_url': None,
             'media_name': None,
+            'media_category': None,
+            'media_type': None,
         }
     
     def transform_seizure(self, seizure_raw: Dict, cursor) -> Dict:
@@ -816,6 +824,8 @@ class MoSeizureETL:
             'mo_media_url': primary_media.get('media_url'),
             'mo_media_name': primary_media.get('media_name'),
             'mo_media_file_id': primary_media.get('media_file_id'),
+            'mo_media_category': primary_media.get('media_category'),
+            'mo_media_type': primary_media.get('media_type'),
             # Dates are always from API (never use CURRENT_TIMESTAMP)
             # Normalize to convert empty strings to None
             'date_created': self.normalize_date_value(seizure_raw.get('DATE_CREATED')),  # TIMESTAMPTZ
@@ -846,7 +856,7 @@ class MoSeizureETL:
                    seized_from, seized_at, seized_by, strength_of_evidence,
                    pos_address1, pos_address2, pos_city, pos_district, pos_pincode,
                    pos_landmark, pos_description, pos_latitude, pos_longitude,
-                   mo_media_url, mo_media_name, mo_media_file_id,
+                   mo_media_url, mo_media_name, mo_media_file_id, mo_media_category, mo_media_type,
                    date_created, date_modified
             FROM {MO_SEIZURES_TABLE}
             WHERE mo_seizure_id = %s
@@ -878,15 +888,17 @@ class MoSeizureETL:
                 'mo_media_url': row[20],
                 'mo_media_name': row[21],
                 'mo_media_file_id': row[22],
-                'date_created': row[23],
-                'date_modified': row[24]
+                'mo_media_category': row[23],
+                'mo_media_type': row[24],
+                'date_created': row[25],
+                'date_modified': row[26]
             }
         return None
 
     def get_existing_seizure_media(self, mo_seizure_id: str, cursor) -> List[Dict]:
         """Get existing media rows for a seizure."""
         query = f"""
-            SELECT media_index, media_file_id, media_url, media_name
+            SELECT media_index, media_file_id, media_url, media_name, media_category, media_type
             FROM {MO_SEIZURE_MEDIA_TABLE}
             WHERE mo_seizure_id = %s
             ORDER BY media_index ASC, id ASC
@@ -904,6 +916,8 @@ class MoSeizureETL:
                 'media_file_id': row[1],
                 'media_url': row[2],
                 'media_name': row[3],
+                'media_category': row[4],
+                'media_type': row[5],
             }
             for row in rows
         ]
@@ -917,6 +931,8 @@ class MoSeizureETL:
                     self.normalize_text_value(entry.get('media_file_id')),
                     self.normalize_text_value(entry.get('media_url')),
                     self.normalize_text_value(entry.get('media_name')),
+                    self.normalize_text_value(entry.get('media_category')),
+                    self.normalize_text_value(entry.get('media_type')),
                 )
                 for entry in entries
             ]
@@ -937,8 +953,10 @@ class MoSeizureETL:
                 media_index,
                 media_file_id,
                 media_url,
-                media_name
-            ) VALUES (%s, %s, %s, %s, %s)
+                media_name,
+                media_category,
+                media_type
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         media_values = [
             (
@@ -947,6 +965,8 @@ class MoSeizureETL:
                 entry.get('media_file_id'),
                 entry.get('media_url'),
                 entry.get('media_name'),
+                entry.get('media_category'),
+                entry.get('media_type'),
             )
             for entry in media_entries
         ]
@@ -1117,6 +1137,8 @@ class MoSeizureETL:
                         'mo_media_url': primary_media.get('media_url'),
                         'mo_media_name': primary_media.get('media_name'),
                         'mo_media_file_id': primary_media.get('media_file_id'),
+                        'mo_media_category': primary_media.get('media_category'),
+                        'mo_media_type': primary_media.get('media_type'),
                         'date_created': seizure.get('date_created'),
                         'date_modified': seizure.get('date_modified'),
                     }
@@ -1173,10 +1195,10 @@ class MoSeizureETL:
                         seized_from, seized_at, seized_by, strength_of_evidence,
                         pos_address1, pos_address2, pos_city, pos_district, pos_pincode,
                         pos_landmark, pos_description, pos_latitude, pos_longitude,
-                        mo_media_url, mo_media_name, mo_media_file_id,
+                        mo_media_url, mo_media_name, mo_media_file_id, mo_media_category, mo_media_type,
                         date_created, date_modified
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                 """
                 cursor.execute(insert_query, (
@@ -1203,6 +1225,8 @@ class MoSeizureETL:
                     seizure.get('mo_media_url'),
                     seizure.get('mo_media_name'),
                     seizure.get('mo_media_file_id'),
+                    seizure.get('mo_media_category'),
+                    seizure.get('mo_media_type'),
                     seizure.get('date_created'),  # From API (or NULL)
                     seizure.get('date_modified')  # From API (or NULL)
                 ))
