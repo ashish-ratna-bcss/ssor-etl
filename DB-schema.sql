@@ -514,7 +514,6 @@ CREATE TABLE public.crimes (
     brief_facts text,
     date_created timestamp without time zone,
     date_modified timestamp without time zone,
-    class_classification character varying(50),
     fir_copy character varying(50),
     additional_json_data jsonb
 );
@@ -651,7 +650,6 @@ CREATE TABLE public.persons (
     email_id character varying(255),
     date_created timestamp without time zone,
     date_modified timestamp without time zone,
-    domicile_classification character varying(50),
     raw_full_name character varying(500),
     gender_confidence numeric(4,3),
     gender_source character varying(20),

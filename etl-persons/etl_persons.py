@@ -23,7 +23,7 @@ from typing import Dict, Optional, List, Set, Tuple, Any
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db_pooling import PostgreSQLConnectionPool, compute_safe_workers
 
-from config import DB_CONFIG, API_CONFIG, LOG_CONFIG, TABLE_CONFIG, PERSON_GENDER_CONFIG, PERSON_GENDER_LLM_CONFIG
+from config import DB_CONFIG, API_CONFIG, LOG_CONFIG, TABLE_CONFIG, PERSON_GENDER_CONFIG
 
 # IST timezone offset (UTC+05:30)
 IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
@@ -76,13 +76,6 @@ class PersonsETL:
         self.threshold_prefix = float(PERSON_GENDER_CONFIG.get('threshold_prefix', 0.85))
         self.threshold_rule   = float(PERSON_GENDER_CONFIG.get('threshold_rule',   0.80))
         self.threshold_suffix = float(PERSON_GENDER_CONFIG.get('threshold_suffix', 0.65))
-        self.threshold_llm    = float(PERSON_GENDER_CONFIG.get('threshold_llm',    0.70))
-        self.llm_gender_enabled = bool(PERSON_GENDER_LLM_CONFIG.get('enabled', True))
-        self.llm_gender_url = str(PERSON_GENDER_LLM_CONFIG.get('url', 'http://192.168.103.106:11434')).rstrip('/')
-        self.llm_gender_model = str(PERSON_GENDER_LLM_CONFIG.get('model', 'llama3.1:8b'))
-        self.llm_gender_timeout = int(PERSON_GENDER_LLM_CONFIG.get('timeout', 20))
-        self.llm_gender_batch_size = int(PERSON_GENDER_LLM_CONFIG.get('batch_size', 20))
-        self._llm_gender_cache: Dict[str, Tuple[str, float]] = {}
         self.stats = {
             'person_ids': 0,
             'api_calls': 0,
@@ -96,14 +89,10 @@ class PersonsETL:
             'dry_run_changes': 0,
             'dry_run_no_change': 0,
             'dry_run_inserts': 0,
-            'llm_skipped': 0,  # Records queued but not resolved by LLM
-            'llm_resolved': 0  # Records successfully resolved by LLM
         }
         self.stats_lock = threading.Lock()
         self.schema_lock = threading.Lock()
         self.dry_run_lock = threading.Lock()
-        self.llm_retry_queue = []  # Track records that failed LLM for retry
-        self.llm_queue_lock = threading.Lock()
 
         self.dry_run_log_file = None
         if self.person_gender_dry_run:
@@ -497,84 +486,6 @@ class PersonsETL:
                 return gender, conf, source
         return None, 0.0, 'heuristic'
 
-    def _infer_gender_llm_batch(self, names: List[str]) -> Dict[str, Tuple[str, float]]:
-        """
-        Call Ollama LLM to infer gender for a batch of Indian person names.
-        Used only when rule-based inference returns Unknown with confidence=0.
-        Returns {name: (gender, confidence)} — missing entries mean LLM also failed.
-        Results are cached to avoid duplicate API calls within a run.
-        """
-        if not self.llm_gender_enabled or not names:
-            return {}
-
-        uncached = [n for n in names if n not in self._llm_gender_cache]
-        if not uncached:
-            return {n: self._llm_gender_cache[n] for n in names if n in self._llm_gender_cache}
-
-        numbered = '\n'.join(f'{i+1}. {name}' for i, name in enumerate(uncached))
-        prompt = (
-            'You classify gender of Indian person names (Telugu, Kannada, Hindi, Urdu, Muslim).\n'
-            'Rules: Shaik/Syed/Md/Mohammad/Khan/Mirza prefix → Male. '
-            '"Bai" alone is ambiguous — check full name context.\n'
-            'IMPORTANT: only return "Male" or "Female" or "Unknown". Never return "Transgender".\n'
-            'Return ONLY a valid JSON object with key "results" containing an array.\n'
-            'Each element: {"name": "<original>", "gender": "Male"|"Female"|"Unknown", "confidence": 0.0-1.0}\n\n'
-            f'Names:\n{numbered}\n\n'
-            f'Expected: {{"results": [{{"name": "{uncached[0]}", "gender": "Male", "confidence": 0.9}}, ...]}}\n\nJSON:'
-        )
-
-        try:
-            resp = requests.post(
-                f'{self.llm_gender_url}/api/generate',
-                json={
-                    'model': self.llm_gender_model,
-                    'prompt': prompt,
-                    'stream': False,
-                    'format': 'json',
-                    'options': {'temperature': 0.0, 'num_predict': 600},
-                },
-                timeout=self.llm_gender_timeout,
-            )
-            if resp.status_code != 200:
-                logger.warning(f'LLM gender inference: HTTP {resp.status_code}')
-                return {}
-
-            raw = resp.json().get('response', '')
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            # Unwrap {"results": [...]} or accept bare list
-            if isinstance(parsed, dict):
-                parsed = next((v for v in parsed.values() if isinstance(v, list)), [])
-            if not isinstance(parsed, list):
-                logger.warning('LLM gender inference: unexpected response format')
-                return {}
-
-            results: Dict[str, Tuple[str, float]] = {}
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get('name', '').strip()
-                gender = item.get('gender', 'Unknown')
-                confidence = min(1.0, float(item.get('confidence', 0.75)))
-                # Transgender is never inferred — API source only
-                if gender in ('Male', 'Female') and name:
-                    results[name] = (gender, confidence)
-                    self._llm_gender_cache[name] = (gender, confidence)
-
-            # Fuzzy match for names the model slightly reformatted
-            for orig in uncached:
-                if orig not in results:
-                    for k, v in results.items():
-                        if orig.lower().strip() == k.lower().strip():
-                            self._llm_gender_cache[orig] = v
-                            break
-
-            logger.debug(f'LLM gender: resolved {len(results)}/{len(uncached)} names')
-            return {n: self._llm_gender_cache[n] for n in names if n in self._llm_gender_cache}
-
-        except Exception as exc:
-            logger.warning(f'LLM gender inference failed: {exc}')
-            return {}
-
     def _normalize_phone_numbers(self, raw_phone: Any) -> List[str]:
         """Normalize phone payloads into a de-duplicated list preserving source order."""
         collected: List[str] = []
@@ -623,7 +534,6 @@ class PersonsETL:
           Pass 1  Prefix       — conf 0.95 — MQC: threshold_prefix  (default 0.85)
           Pass 2  Rule-map     — conf 0.90 — MQC: threshold_rule    (default 0.80)
           Pass 3  Suffix       — conf 0.65 — MQC: threshold_suffix  (default 0.65)
-          Pass 4  LLM          — conf varies — MQC: threshold_llm   (default 0.70)
           Fallback → 'Unknown'
 
         A pass is skipped entirely when its result is None OR its confidence falls
@@ -664,15 +574,6 @@ class PersonsETL:
         gender, conf, source = self._infer_pass_suffix(tokens)
         if gender and conf >= self.threshold_suffix:
             return gender, conf, source
-
-        # ── Pass 4: LLM fallback ─────────────────────────────────────────────────
-        if self.llm_gender_enabled:
-            llm_result = self._infer_gender_llm_batch([clean_name])
-            if clean_name in llm_result:
-                llm_gender, llm_conf = llm_result[clean_name]
-                # Transgender is never assigned by inference — API source only.
-                if llm_gender in ('Male', 'Female') and llm_conf >= self.threshold_llm:
-                    return llm_gender, llm_conf, 'llm'
 
         # ── All passes failed ────────────────────────────────────────────────────
         return 'Unknown', 0.0, 'unknown'
@@ -1266,9 +1167,6 @@ class PersonsETL:
 
             fix_batch: List[Tuple[str, str, float, str, str]] = []
 
-            # Collect names that may need LLM batch processing (confidence=0 after rule pass)
-            pending_llm: List[Tuple[str, str, str]] = []  # (person_id, inference_name, old_gender)
-
             for person_id, full_name, raw_full_name, db_name, db_surname, db_alias, old_gender, old_conf, old_source in rows:
                 personal_mirror = {
                     'FULL_NAME': full_name or raw_full_name,
@@ -1283,9 +1181,6 @@ class PersonsETL:
                 )
 
                 if new_gender == old_gender or new_gender == 'Unknown':
-                    # If still Unknown after rules, queue for LLM batch
-                    if new_gender == 'Unknown' and new_conf == 0.0 and inference_name and self.llm_gender_enabled:
-                        pending_llm.append((person_id, inference_name, old_gender))
                     continue
 
                 corrected += 1
@@ -1295,43 +1190,6 @@ class PersonsETL:
                 )
                 if not effective_dry_run:
                     fix_batch.append((new_gender, new_conf, new_source, person_id, old_gender))
-
-            # LLM batch pass for names that rule engine could not resolve
-            llm_failed_records = []
-            if pending_llm:
-                logger.info(f"   🤖 LLM batch pass for {len(pending_llm)} unresolved names …")
-                bs = self.llm_gender_batch_size
-                for chunk_start in range(0, len(pending_llm), bs):
-                    chunk = pending_llm[chunk_start: chunk_start + bs]
-                    name_list = [inf_name for _, inf_name, _ in chunk]
-                    llm_results = self._infer_gender_llm_batch(name_list)
-                    for person_id, inf_name, old_gender in chunk:
-                        if inf_name not in llm_results:
-                            llm_failed_records.append((person_id, inf_name, old_gender))
-                            with self.stats_lock:
-                                self.stats['llm_skipped'] += 1
-                            continue
-                        llm_gender, llm_conf = llm_results[inf_name]
-                        if llm_gender == old_gender or llm_gender == 'Unknown':
-                            llm_failed_records.append((person_id, inf_name, old_gender))
-                            with self.stats_lock:
-                                self.stats['llm_skipped'] += 1
-                            continue
-                        corrected += 1
-                        with self.stats_lock:
-                            self.stats['llm_resolved'] += 1
-                        logger.info(
-                            f"   🤖 {person_id} | {inf_name!r} → "
-                            f"{old_gender} → {llm_gender} (llm {llm_conf:.3f})"
-                        )
-                        if not effective_dry_run:
-                            fix_batch.append((llm_gender, llm_conf, 'llm', person_id, old_gender))
-
-                # Queue failed records for retry with available parallel workers
-                if llm_failed_records:
-                    with self.llm_queue_lock:
-                        self.llm_retry_queue.extend(llm_failed_records)
-                    logger.warning(f"   ⏳ Queued {len(llm_failed_records)} records for LLM retry in next batch")
 
             if fix_batch and not effective_dry_run:
                 with self.db_pool.get_connection_context() as conn:
@@ -2085,58 +1943,6 @@ class PersonsETL:
                                         f"Failed: {self.stats['failed']}"
                                     )
 
-            # Process queued LLM retry records with available parallel workers
-            with self.llm_queue_lock:
-                retry_queue = self.llm_retry_queue.copy()
-                self.llm_retry_queue.clear()
-
-            if retry_queue and self.llm_gender_enabled:
-                logger.info("")
-                logger.info(f"🔄 Processing {len(retry_queue)} queued LLM retry records …")
-
-                retry_fix_batch = []
-                retry_bs = self.llm_gender_batch_size
-                for chunk_start in range(0, len(retry_queue), retry_bs):
-                    chunk = retry_queue[chunk_start: chunk_start + retry_bs]
-                    name_list = [inf_name for _, inf_name, _ in chunk]
-                    llm_results = self._infer_gender_llm_batch(name_list)
-                    for person_id, inf_name, old_gender in chunk:
-                        if inf_name not in llm_results:
-                            logger.debug(f"   ⏭️  {person_id} | {inf_name!r} — LLM still unable to resolve")
-                            continue
-                        llm_gender, llm_conf = llm_results[inf_name]
-                        if llm_gender == old_gender or llm_gender == 'Unknown':
-                            logger.debug(f"   ⏭️  {person_id} | {inf_name!r} — no gender change {old_gender} → {llm_gender}")
-                            continue
-                        logger.info(
-                            f"   ✅ {person_id} | {inf_name!r} → "
-                            f"{old_gender} → {llm_gender} (retry, llm {llm_conf:.3f})"
-                        )
-                        retry_fix_batch.append((llm_gender, llm_conf, 'llm', person_id, old_gender))
-                        with self.stats_lock:
-                            self.stats['llm_resolved'] += 1
-
-                if retry_fix_batch:
-                    with self.db_pool.get_connection_context() as conn:
-                        cursor = conn.cursor()
-                        execute_batch(
-                            cursor,
-                            f"""
-                            UPDATE {PERSONS_TABLE}
-                            SET gender = %s,
-                                gender_confidence = %s,
-                                gender_source = %s
-                            WHERE person_id = %s
-                              AND gender = %s
-                              AND (gender_source IS NULL
-                                   OR gender_source NOT IN ('api', 'invalid_name'))
-                            """,
-                            retry_fix_batch,
-                            page_size=500,
-                        )
-                        conn.commit()
-                    logger.info(f"✅ Resolved {len(retry_fix_batch)} retried records via LLM")
-
             # Get database counts
             with self.db_pool.get_connection_context() as conn:
                 cursor = conn.cursor()
@@ -2166,10 +1972,6 @@ class PersonsETL:
             if self.stats['person_ids'] > 0:
                 coverage = ((self.stats['inserted'] + self.stats['updated']) / self.stats['person_ids']) * 100
                 logger.info(f"  Processed → DB Coverage: {coverage:.2f}%")
-            logger.info(f"")
-            logger.info(f"🤖 LLM GENDER INFERENCE:")
-            logger.info(f"  Resolved by LLM:          {self.stats['llm_resolved']}")
-            logger.info(f"  Queued (unable to resolve): {self.stats['llm_skipped']}")
             logger.info(f"")
             logger.info(f"❌ Errors:                  {self.stats['errors']}")
             if self.person_gender_dry_run:
