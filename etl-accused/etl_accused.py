@@ -396,7 +396,19 @@ class AccusedETL:
         except Exception as e:
             logger.error(f"Error getting table columns for {table_name}: {e}")
             return set()
-    
+
+    def pending_crime_ids(self, cursor) -> List[str]:
+        """crime_ids already in crimes but with no accused rows fetched yet --
+        SSOR branch: accused is driven off crimes (GET /accused/{crimeId}),
+        not an independent date-range scan."""
+        cursor.execute(f"""
+            SELECT c.crime_id FROM {CRIMES_TABLE} c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {ACCUSED_TABLE} a WHERE a.crime_id = c.crime_id
+            )
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
     def get_effective_start_date(self) -> str:
         """
         Get effective start date for ETL:
@@ -1675,20 +1687,24 @@ class AccusedETL:
         
         self.db_log.flush()
 
-    def process_date_range(self, from_date: str, to_date: str, table_columns: Set[str] = None):
-        """Process accused for a specific date range"""
-        chunk_range = f"{from_date} to {to_date}"
+    def process_crime_id(self, crime_id: str, table_columns: Set[str] = None):
+        """Process accused for a single crime_id (GET /accused/{crimeId}) --
+        SSOR branch: driven off crimes, not an independent date-range scan.
+        from_date/to_date positions below are just log labels; log_api_chunk
+        and log_db_chunk only use them for display."""
+        from_date = to_date = f"crime_id={crime_id}"
+        chunk_range = from_date
         logger.info(f"📅 Processing: {chunk_range}")
-        
+
         # Fetch accused from API
-        accused_raw = self.fetch_accused_api(from_date, to_date)
-        
+        accused_raw = self.fetch_accused_by_crime_id(crime_id)
+
         if accused_raw is None:
             logger.error(f"❌ Failed to fetch accused for {chunk_range}")
             self.log_api_chunk(from_date, to_date, [], error="API fetch failed")
             self.log_db_chunk(from_date, to_date, 0, [], [], [], [], {}, error="API fetch failed")
             return
-        
+
         if not accused_raw:
             logger.info(f"ℹ️  No accused found for {chunk_range}")
             self.log_api_chunk(from_date, to_date, [])
@@ -1949,38 +1965,19 @@ class AccusedETL:
         try:
             self.ensure_run_state_table()
 
-            # Strict incremental mode: always use dynamic resume + automatic end date
-            if RUN_MODE != 1:
-                logger.warning("⚠️ ACCUSED_RUN_MODE!=1 ignored. Enforcing strict incremental mode.")
-
-            effective_start_date = self.get_effective_start_date()
-            checkpoint_date = self.get_run_checkpoint('accused')
-            if checkpoint_date:
-                checkpoint_iso = checkpoint_date if isinstance(checkpoint_date, str) else checkpoint_date.isoformat()
-                if parse_iso_date(checkpoint_iso) > parse_iso_date(effective_start_date):
-                    effective_start_date = checkpoint_iso
-
-            calculated_end_date = get_yesterday_end_ist()
-            logger.info(f"🔄 Incremental Mode: Fetching data from {effective_start_date} to {calculated_end_date}")
-            
-            # Get table columns for schema evolution
+            # SSOR branch: accused is driven off crime_ids already in crimes
+            # (GET /accused/{crimeId}), not an independent date-range scan --
+            # resumability comes from pending_crime_ids' NOT EXISTS check,
+            # not from a date checkpoint.
             table_columns = self.get_table_columns(ACCUSED_TABLE)
             logger.debug(f"Existing table columns: {sorted(table_columns)}")
-            
-            ranges = self.generate_date_ranges(
-                effective_start_date, 
-                calculated_end_date, 
-                ETL_CONFIG['chunk_days'],
-                ETL_CONFIG.get('chunk_overlap_days', 1)  # Default to 1 day overlap for safety
-            )
-            
-            logger.info(f"Date Range: {effective_start_date} to {calculated_end_date}")
-            overlap_days = ETL_CONFIG.get('chunk_overlap_days', 1)
-            logger.info(f"Chunk Size: {ETL_CONFIG['chunk_days']} days (overlap: {overlap_days} day(s) to ensure no data loss)")
+
+            with self.db_pool.get_connection_context() as conn:
+                cursor = conn.cursor()
+                crime_ids = self.pending_crime_ids(cursor)
+
+            logger.info(f"📊 Found {len(crime_ids)} crime_ids pending accused fetch")
             logger.info("=" * 80)
-            
-            logger.info(f"📊 Total date ranges to process: {len(ranges)}")
-            logger.info(f"ℹ️  Expected Total from API Team: 22423 (insert + update records)")
             logger.info("")
             
             # Chunk-level parallelism - defaults to 4 for DB connection safety
@@ -1990,26 +1987,26 @@ class AccusedETL:
             inter_chunk_sleep = get_float_env('ACCUSED_INTER_CHUNK_SLEEP', 0.0)
 
             if chunk_workers <= 1:
-                for fd, td in tqdm(ranges, desc="Processing date ranges", unit="range"):
-                    self.process_date_range(fd, td, table_columns)
+                for crime_id in tqdm(crime_ids, desc="Processing crime_ids", unit="crime"):
+                    self.process_crime_id(crime_id, table_columns)
                     if inter_chunk_sleep > 0:
                         time.sleep(inter_chunk_sleep)
             else:
-                logger.info(f"🚀 Starting parallel chunk processing with {chunk_workers} workers")
+                logger.info(f"🚀 Starting parallel crime_id processing with {chunk_workers} workers")
                 with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
-                    future_to_range = {
-                        executor.submit(self.process_date_range, fd, td, table_columns): (fd, td)
-                        for fd, td in ranges
+                    future_to_crime = {
+                        executor.submit(self.process_crime_id, crime_id, table_columns): crime_id
+                        for crime_id in crime_ids
                     }
-                    with tqdm(total=len(ranges), desc="Processing date ranges", unit="range") as pbar:
-                        for future in as_completed(future_to_range):
-                            fd, td = future_to_range[future]
+                    with tqdm(total=len(crime_ids), desc="Processing crime_ids", unit="crime") as pbar:
+                        for future in as_completed(future_to_crime):
+                            crime_id = future_to_crime[future]
                             try:
                                 future.result()
                             except Exception as exc:
-                                logger.error(f"Chunk failed {fd} to {td}: {exc}")
+                                logger.error(f"crime_id {crime_id} failed: {exc}")
                                 with self.stats_lock:
-                                    self.stats['errors'].append(f"Chunk failed {fd} to {td}: {exc}")
+                                    self.stats['errors'].append(f"crime_id {crime_id} failed: {exc}")
                             pbar.update(1)
 
             # Get database counts
@@ -2077,8 +2074,7 @@ class AccusedETL:
             
             # Write summary to log files
             self.write_log_summaries()
-            self.update_run_checkpoint('accused', calculated_end_date)
-            
+
             logger.info("✅ ETL Pipeline completed successfully!")
             logger.info(f"📝 API chunk log saved to: {self.api_log_file}")
             logger.info(f"📝 DB chunk log saved to: {self.db_log_file}")
