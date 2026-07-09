@@ -387,7 +387,20 @@ class InterrogationReportsETL:
         except Exception as e:
             logger.error(f"Error getting table columns for {table_name}: {e}")
             return set()
-    
+
+    def pending_crime_ids(self, cursor) -> List[str]:
+        """crime_ids already in crimes but with no IR rows fetched yet --
+        SSOR branch: IR is driven off crimes (GET
+        /interrogation-reports/v1/{crimeId}), not an independent
+        date-range scan."""
+        cursor.execute(f"""
+            SELECT c.crime_id FROM {CRIMES_TABLE} c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {IR_TABLE} i WHERE i.crime_id = c.crime_id
+            )
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
     def get_effective_start_date(self) -> str:
         """
         Get effective start date for ETL:
@@ -646,6 +659,64 @@ class InterrogationReportsETL:
                 time.sleep(2 ** attempt)
         
         logger.error(f"❌ Failed to fetch IR data for {from_date} to {to_date} after {API_CONFIG['max_retries']} attempts")
+        return None
+
+    def fetch_ir_by_crime_id(self, crime_id: str) -> Optional[List[Dict[str, Any]]]:
+        """GET /interrogation-reports/v1/{crimeId} -- SSOR branch: IR is
+        driven off crimes, not an independent date-range scan."""
+        url = f"{API_CONFIG['ir_url'].rstrip('/')}/{crime_id}"
+        headers = {'x-api-key': API_CONFIG['api_key']}
+
+        for attempt in range(API_CONFIG['max_retries']):
+            try:
+                logger.debug(f"Fetching IR data for crime_id {crime_id} (Attempt {attempt + 1})")
+                response = requests.get(url, headers=headers, timeout=API_CONFIG['timeout'])
+
+                if response.status_code == 200:
+                    data = response.json()
+                    with self.stats_lock:
+                        self.stats['total_api_calls'] += 1
+
+                    if data.get('status'):
+                        records = data.get('data', [])
+                        if records:
+                            if isinstance(records, dict):
+                                records = [records]
+                            logger.info(f"✅ Fetched {len(records)} IR records for crime_id {crime_id}")
+                            return records
+                        else:
+                            logger.warning(f"⚠️  No IR records found for crime_id {crime_id}")
+                            return []
+                    else:
+                        logger.warning(f"⚠️  API returned status=false for crime_id {crime_id}")
+                        return []
+
+                elif response.status_code == 404:
+                    logger.warning(f"⚠️  No IR data found for crime_id {crime_id} (404)")
+                    return []
+
+                elif response.status_code == 429:
+                    retry_after = response.headers.get('Retry-After')
+                    wait_time = float(retry_after) if retry_after else min(60, 2 ** attempt + random.uniform(0, 1))
+                    logger.warning(f"⚠️  API rate limited (429), waiting {wait_time:.1f}s (attempt {attempt + 1})")
+                    time.sleep(wait_time)
+
+                else:
+                    logger.warning(f"API returned status code {response.status_code} for crime_id {crime_id}, retrying...")
+                    time.sleep(2 ** attempt + random.uniform(0, 0.5))
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"API timeout for crime_id {crime_id}, retrying... (Attempt {attempt + 1})")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.error(f"API error for crime_id {crime_id}: {e}")
+                if attempt == API_CONFIG['max_retries'] - 1:
+                    with self.stats_lock:
+                        self.stats['failed_api_calls'] += 1
+                        self.stats['errors'].append(f"crime_id {crime_id}: {str(e)}")
+                time.sleep(2 ** attempt)
+
+        logger.error(f"❌ Failed to fetch IR data for crime_id {crime_id} after {API_CONFIG['max_retries']} attempts")
         return None
 
     def get_existing_ir_record(self, ir_id: str, cursor) -> Optional[Dict[str, Any]]:
@@ -1652,10 +1723,12 @@ class InterrogationReportsETL:
                 self.stats['errors'].append(f"IR {ir_id}: {str(e)}")
             raise
     
-    def process_date_range(self, from_date: str, to_date: str, table_columns: Set[str] = None):
-        """Process IR records for a specific date range"""
-        logger.info(f"📅 Processing: {from_date} to {to_date}")
-        
+    def process_crime_id(self, crime_id: str, table_columns: Set[str] = None):
+        """Process IR records for a single crime_id (GET
+        /interrogation-reports/v1/{crimeId}) -- SSOR branch: driven off
+        crimes."""
+        logger.info(f"📅 Processing: crime_id={crime_id}")
+
         # Initialize chunk-level statistics
         chunk_stats = {
             'inserted': 0,
@@ -1663,26 +1736,26 @@ class InterrogationReportsETL:
             'no_change': 0,
             'failed': 0
         }
-        
+
         # Store initial stats to calculate chunk differences
         initial_inserted = self.stats['total_ir_inserted']
         initial_updated = self.stats['total_ir_updated']
         initial_no_change = self.stats['total_ir_no_change']
         initial_failed = self.stats['total_ir_failed']
-        
+
         # Fetch IR records from API
-        records = self.fetch_ir_data_from_api(from_date, to_date)
-        
+        records = self.fetch_ir_by_crime_id(crime_id)
+
         if records is None:
-            logger.error(f"❌ Failed to fetch IR records for {from_date} to {to_date}")
+            logger.error(f"❌ Failed to fetch IR records for crime_id={crime_id}")
             chunk_stats['failed'] = 1  # API call failed
             self.stats['total_ir_failed'] += 1
             return
-        
+
         if not records:
-            logger.info(f"ℹ️  No IR records found for {from_date} to {to_date} - continuing to next chunk")
+            logger.info(f"ℹ️  No IR records found for crime_id={crime_id} - continuing")
             return
-        
+
         # Check for schema evolution if we got data
         if table_columns is not None and len(records) > 0:
             # Check for new fields in first record
@@ -1695,12 +1768,12 @@ class InterrogationReportsETL:
                         # Update table_columns set
                         table_columns.add(db_column)
                 # Update existing records from start_date to current chunk end_date
-                self.update_existing_records_with_new_fields(new_fields, to_date)
-        
+                self.update_existing_records_with_new_fields(new_fields, crime_id)
+
         # Process each record
         with self.stats_lock:
             self.stats['total_ir_fetched'] += len(records)
-            
+
         def process_record_worker(record):
             try:
                 with self.db_pool.get_connection_context() as conn:
@@ -1712,21 +1785,21 @@ class InterrogationReportsETL:
                 logger.error(f"Worker thread error: {e}")
                 with self.stats_lock:
                     self.stats['total_ir_failed'] += 1
-        
+
         requested_workers = int(os.environ.get('MAX_WORKERS', min(32, (os.cpu_count() or 1) * 4)))
         max_workers = compute_safe_workers(self.db_pool, requested_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             list(executor.map(process_record_worker, records))
-        
+
         with self.stats_lock:
             # Calculate chunk statistics
             chunk_stats['inserted'] = self.stats['total_ir_inserted'] - initial_inserted
             chunk_stats['updated'] = self.stats['total_ir_updated'] - initial_updated
             chunk_stats['no_change'] = self.stats['total_ir_no_change'] - initial_no_change
             chunk_stats['failed'] = self.stats['total_ir_failed'] - initial_failed
-        
+
         # Log chunk statistics
-        logger.info(f"✅ Completed: {from_date} to {to_date}")
+        logger.info(f"✅ Completed: crime_id={crime_id}")
         logger.info(f"   📊 Chunk Stats - Inserted: {chunk_stats['inserted']}, Updated: {chunk_stats['updated']}, "
                    f"No Change: {chunk_stats['no_change']}, Failed: {chunk_stats['failed']}")
     
@@ -1760,56 +1833,45 @@ class InterrogationReportsETL:
             # Load crime IDs into memory
             self.load_crime_ids()
 
-            # Get effective start date (check if table has data)
-            effective_start_date = self.get_effective_start_date()
-            logger.info(f"Effective Start Date: {effective_start_date}")
-            
             # Get table columns for schema evolution
             table_columns = self.get_table_columns(IR_TABLE)
             logger.debug(f"Existing table columns: {sorted(table_columns)}")
-            
-            # Generate date ranges with NO overlap (more efficient)
-            # API has 7-day limit on date ranges, so use 7 days (vs original 5)
-            # No overlap = fewer redundant API calls
-            date_ranges = self.generate_date_ranges(
-                effective_start_date,
-                calculated_end_date,
-                chunk_days=7,   # API limit: max 7 days per call
-                overlap_days=0  # Removed overlap for efficiency
-            )
 
-            logger.info(f"Date Range: {effective_start_date} to {calculated_end_date}")
-            logger.info(f"Chunk Size: 7 days (API limit, no overlap for efficiency)")
+            # SSOR branch: IR is driven off crime_ids already in crimes
+            # (GET /interrogation-reports/v1/{crimeId}), not an independent
+            # date-range scan -- resumability comes from pending_crime_ids'
+            # NOT EXISTS check, not a date checkpoint.
+            with self.db_pool.get_connection_context() as conn:
+                with conn.cursor() as cursor:
+                    crime_ids = self.pending_crime_ids(cursor)
+
+            logger.info(f"📊 Found {len(crime_ids)} crime_ids pending IR fetch")
             logger.info("=" * 80)
-
-            logger.info(f"📊 Total date ranges to process: {len(date_ranges)}")
-            logger.info(f"⚡ Optimization: Parallel API calls with 3-5 concurrent requests")
             logger.info("")
 
-            # Process date ranges with parallel API calls
-            if len(date_ranges) > 0:
+            # Process crime_ids with parallel API calls
+            if len(crime_ids) > 0:
                 # Use ThreadPoolExecutor for concurrent API requests
                 # Default: 8 workers (from .env), can override with MAX_API_WORKERS env var
-                # Optimized: 4 → 8 reduces execution time by 30-40% (1319s → 800-950s)
                 max_api_workers = int(os.environ.get('MAX_API_WORKERS', 8))
-                max_api_workers = min(max_api_workers, len(date_ranges))  # Don't exceed number of ranges
-                logger.info(f"⚡ Using {max_api_workers} parallel API workers (optimized from 4)")
+                max_api_workers = min(max_api_workers, len(crime_ids))  # Don't exceed number of crime_ids
+                logger.info(f"⚡ Using {max_api_workers} parallel API workers")
 
                 with ThreadPoolExecutor(max_workers=max_api_workers) as api_executor:
                     # Submit all API calls
                     futures = {}
-                    for from_date, to_date in date_ranges:
-                        future = api_executor.submit(self.process_date_range, from_date, to_date, table_columns)
-                        futures[future] = (from_date, to_date)
+                    for crime_id in crime_ids:
+                        future = api_executor.submit(self.process_crime_id, crime_id, table_columns)
+                        futures[future] = crime_id
 
                     # Process results as they complete (not in order)
-                    with tqdm(total=len(date_ranges), desc="Processing date ranges", unit="range") as pbar:
+                    with tqdm(total=len(crime_ids), desc="Processing crime_ids", unit="crime") as pbar:
                         for future in as_completed(futures):
-                            from_date, to_date = futures[future]
+                            crime_id = futures[future]
                             try:
                                 future.result()
                             except Exception as e:
-                                logger.error(f"Error processing {from_date} to {to_date}: {e}")
+                                logger.error(f"Error processing crime_id={crime_id}: {e}")
                                 with self.stats_lock:
                                     self.stats['failed_api_calls'] += 1
                             pbar.update(1)

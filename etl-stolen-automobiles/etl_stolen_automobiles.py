@@ -133,6 +133,51 @@ class StolenAutomobilesETL:
         logger.error(f"Failed to fetch stolen automobiles for {from_date} to {to_date} after max retries")
         return None
 
+    def fetch_stolen_automobiles_by_crime_id(self, crime_id: str) -> list[dict] | None:
+        """GET /reports/stolen-automobiles/{crimeId} -- SSOR branch: driven
+        off crimes, not an independent date-range scan."""
+        url = f"{API_CONFIG['base_url']}/reports/stolen-automobiles/{crime_id}"
+        headers = {'x-api-key': API_CONFIG['api_key']}
+        for attempt in range(API_CONFIG['max_retries']):
+            try:
+                logger.debug(f"Fetching stolen automobiles for crime_id {crime_id} (attempt {attempt + 1})")
+                response = requests.get(url, headers=headers, timeout=API_CONFIG['timeout'])
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('status'):
+                        records = data.get('data') or []
+                        if isinstance(records, dict):
+                            records = [records]
+                        logger.info(f"Fetched {len(records)} stolen automobile records for crime_id {crime_id}")
+                        return records
+                    logger.warning(f"API returned status=false for crime_id {crime_id}")
+                    return []
+                if response.status_code == 404:
+                    return []
+                logger.warning(f"API returned status code {response.status_code} for crime_id {crime_id}, retrying...")
+                time.sleep(2 ** attempt)
+            except requests.exceptions.Timeout:
+                logger.warning(f"API timeout for crime_id {crime_id}, retrying... (attempt {attempt + 1})")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.error(f"API error for crime_id {crime_id}: {e}")
+                time.sleep(2 ** attempt)
+        self.stats['failed_api_calls'] += 1
+        logger.error(f"Failed to fetch stolen automobiles for crime_id {crime_id} after max retries")
+        return None
+
+    def pending_crime_ids(self, cursor) -> list[str]:
+        """crime_ids already in crimes but with no stolen_automobiles rows
+        fetched yet -- SSOR branch: driven off crimes (GET
+        /reports/stolen-automobiles/{crimeId}), not date-range scanning."""
+        cursor.execute(f"""
+            SELECT c.crime_id FROM {CRIMES_TABLE} c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {STOLEN_AUTOMOBILES_TABLE} s WHERE s.crime_id = c.crime_id
+            )
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
     def crime_exists(self, cursor, crime_id: str) -> bool:
         if not crime_id:
             return False
@@ -171,8 +216,8 @@ class StolenAutomobilesETL:
                 [(stolen_property_id, ref) for ref in media_refs if ref],
             )
 
-    def process_date_range(self, from_date: str, to_date: str) -> None:
-        records = self.fetch_stolen_automobiles_api(from_date, to_date)
+    def process_crime_id(self, crime_id: str) -> None:
+        records = self.fetch_stolen_automobiles_by_crime_id(crime_id)
         if records is None:
             return
         self.stats['fetched'] += len(records)
@@ -188,11 +233,15 @@ class StolenAutomobilesETL:
                 conn.commit()
 
     def run(self) -> None:
-        start_date = self.get_effective_start_date()
-        end_date = datetime.now().strftime('%Y-%m-%d')
-        logger.info(f"Running etl-stolen-automobiles from {start_date} to {end_date}")
-        for from_date, to_date in self.generate_date_ranges(start_date, end_date):
-            self.process_date_range(from_date, to_date)
+        # SSOR branch: driven off crime_ids already in crimes, not an
+        # independent date-range scan -- resumability comes from
+        # pending_crime_ids' NOT EXISTS check, not a date checkpoint.
+        with self.db_pool.get_connection_context() as conn:
+            with conn.cursor() as cursor:
+                crime_ids = self.pending_crime_ids(cursor)
+        logger.info(f"Running etl-stolen-automobiles for {len(crime_ids)} pending crime_ids")
+        for crime_id in crime_ids:
+            self.process_crime_id(crime_id)
         logger.info(f"Done. Stats: {self.stats}")
 
 
