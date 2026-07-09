@@ -333,7 +333,19 @@ class ChargesheetsETL:
             logger.error(f"Error getting table columns for {table_name}: {e}")
             self._conn.rollback()
             return set()
-    
+
+    def pending_crime_ids(self) -> List[str]:
+        """crime_ids already in crimes but with no chargesheets rows fetched
+        yet -- SSOR branch: driven off crimes (GET
+        /chargesheets/{crimeId}), not an independent date-range scan."""
+        self._cursor.execute(f"""
+            SELECT c.crime_id FROM {CRIMES_TABLE} c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {CHARGESHEETS_TABLE} cs WHERE cs.crime_id = c.crime_id
+            )
+        """)
+        return [row[0] for row in self._cursor.fetchall()]
+
     def get_effective_start_date(self) -> str:
         """
         Get effective start date for ETL by checking all 4 chargesheet tables:
@@ -684,8 +696,58 @@ class ChargesheetsETL:
         logger.error(f"❌ Failed to fetch chargesheets for {from_date} to {to_date} after {API_CONFIG['max_retries']} attempts")
         self.log_api_chunk(from_date, to_date, 0, [], [], error="Failed after max retries")
         return None
-    
-    def log_api_chunk(self, from_date: str, to_date: str, count: int, crime_ids: List[str], 
+
+    def fetch_chargesheets_by_crime_id(self, crime_id: str) -> Optional[List[Dict]]:
+        """GET /chargesheets/{crimeId} -- SSOR branch: chargesheets is
+        driven off crimes, not an independent date-range scan."""
+        url = f"{API_CONFIG['base_url']}/chargesheets/{crime_id}"
+        headers = {'x-api-key': API_CONFIG['api_key']}
+
+        for attempt in range(API_CONFIG['max_retries']):
+            try:
+                logger.debug(f"Fetching chargesheets for crime_id {crime_id} (Attempt {attempt + 1})")
+                response = requests.get(url, headers=headers, timeout=API_CONFIG['timeout'])
+
+                if response.status_code == 200:
+                    data = response.json()
+                    self.stats['total_api_calls'] += 1
+
+                    if data.get('status'):
+                        chargesheets_data = data.get('data')
+                        if chargesheets_data:
+                            if isinstance(chargesheets_data, dict):
+                                chargesheets_data = [chargesheets_data]
+                            logger.info(f"✅ Fetched {len(chargesheets_data)} chargesheet records for crime_id {crime_id}")
+                            return chargesheets_data
+                        else:
+                            logger.warning(f"⚠️  No chargesheet records found for crime_id {crime_id}")
+                            return []
+                    else:
+                        logger.warning(f"⚠️  API returned status=false for crime_id {crime_id}")
+                        return []
+
+                elif response.status_code == 404:
+                    logger.warning(f"⚠️  No chargesheets found for crime_id {crime_id} (404)")
+                    return []
+
+                else:
+                    logger.warning(f"API returned status code {response.status_code} for crime_id {crime_id}, retrying...")
+                    time.sleep(2 ** attempt)
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"API timeout for crime_id {crime_id}, retrying... (Attempt {attempt + 1})")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.error(f"API error for crime_id {crime_id}: {e}")
+                if attempt == API_CONFIG['max_retries'] - 1:
+                    self.stats['failed_api_calls'] += 1
+                    self.stats['errors'].append(f"crime_id {crime_id}: {str(e)}")
+                time.sleep(2 ** attempt)
+
+        logger.error(f"❌ Failed to fetch chargesheets for crime_id {crime_id} after {API_CONFIG['max_retries']} attempts")
+        return None
+
+    def log_api_chunk(self, from_date: str, to_date: str, count: int, crime_ids: List[str],
                      chargesheets_data: List[Dict], error: Optional[str] = None):
         """Log API response for a chunk"""
         chunk_info = {
@@ -1502,24 +1564,27 @@ class ChargesheetsETL:
             with self.stats_lock:
                 self.stats['total_chargesheets_failed'] += 1
 
-    def process_date_range(self, from_date: str, to_date: str, table_columns: Set[str] = None):
-        """Process chargesheet records for a specific date range"""
-        chunk_range = f"{from_date} to {to_date}"
+    def process_crime_id(self, crime_id: str, table_columns: Set[str] = None):
+        """Process chargesheet records for a single crime_id (GET
+        /chargesheets/{crimeId}) -- SSOR branch: driven off crimes. Log
+        helpers below only use from_date/to_date as display labels."""
+        from_date = to_date = f"crime_id={crime_id}"
+        chunk_range = from_date
         logger.info(f"📅 Processing: {chunk_range}")
-        
+
         # Fetch chargesheets from API
-        chargesheets_raw = self.fetch_chargesheets_api(from_date, to_date)
-        
+        chargesheets_raw = self.fetch_chargesheets_by_crime_id(crime_id)
+
         if chargesheets_raw is None:
             logger.error(f"❌ Failed to fetch chargesheets for {chunk_range}")
             self.log_db_chunk(from_date, to_date, 0, [], [], [], [], {}, error="API fetch failed")
             return
-        
+
         if not chargesheets_raw:
             logger.info(f"ℹ️  No chargesheet records found for {chunk_range}")
             self.log_db_chunk(from_date, to_date, 0, [], [], [], [], {}, error="No chargesheet records in API response")
             return
-        
+
         # Check for schema evolution if we got data
         if table_columns is not None and len(chargesheets_raw) > 0:
             # Check for new fields in first record
@@ -1532,8 +1597,8 @@ class ChargesheetsETL:
                         # Update table_columns set
                         table_columns.add(db_column)
                 # Update existing records from start_date to current chunk end_date
-                self.update_existing_records_with_new_fields(new_fields, to_date)
-        
+                self.update_existing_records_with_new_fields(new_fields, crime_id)
+
         with self.stats_lock:
             self.stats['total_chargesheets_fetched'] += len(chargesheets_raw)
         logger.trace(f"Processing {len(chargesheets_raw)} chargesheet records for chunk {chunk_range}")
@@ -1766,11 +1831,6 @@ class ChargesheetsETL:
                 logger.warning("FK queue drain failed at startup: %s (non-fatal)", _de)
         
         try:
-            # Get effective start date (check if all 4 tables have data)
-            # This will rollback any failed transactions first
-            effective_start_date = self.get_effective_start_date()
-            logger.info(f"Effective Start Date: {effective_start_date}")
-            
             # Get table columns for schema evolution
             # This will also rollback any failed transactions first
             table_columns = self.get_table_columns(CHARGESHEETS_TABLE)
@@ -1778,34 +1838,19 @@ class ChargesheetsETL:
                 logger.debug(f"Existing table columns: {sorted(table_columns)}")
             else:
                 logger.info("📊 No existing columns found (table may be empty or new), will detect schema from API")
-            
-            # Generate date ranges with overlap to ensure no data is missed
-            date_ranges = self.generate_date_ranges(
-                effective_start_date,
-                calculated_end_date,
-                ETL_CONFIG['chunk_days'],
-                ETL_CONFIG.get('chunk_overlap_days', 1)  # Default to 1 day overlap for safety
-            )
-            
-            logger.info(f"Date Range: {effective_start_date} to {calculated_end_date}")
-            overlap_days = ETL_CONFIG.get('chunk_overlap_days', 1)
-            logger.info(f"Chunk Size: {ETL_CONFIG['chunk_days']} days (overlap: {overlap_days} day(s) to ensure no data loss)")
+
+            # SSOR branch: chargesheets is driven off crime_ids already in
+            # crimes (GET /chargesheets/{crimeId}), not an independent
+            # date-range scan -- resumability comes from pending_crime_ids'
+            # NOT EXISTS check, not a date checkpoint.
+            crime_ids = self.pending_crime_ids()
+            logger.info(f"📊 Found {len(crime_ids)} crime_ids pending chargesheets fetch")
             logger.info("=" * 80)
-            
-            logger.info(f"📊 Total date ranges to process: {len(date_ranges)}")
-            logger.trace(f"Generated date ranges: {date_ranges[:5]}{'...' if len(date_ranges) > 5 else ''} (showing first 5)")
             logger.info("")
-            start_dt = parse_iso_date(effective_start_date)
-            end_dt = parse_iso_date(calculated_end_date)
-            logger.info(f"ℹ️  API Server Timezone: IST (UTC+05:30)")
-            logger.info(f"ℹ️  Date Range: {format_iso_date(start_dt)} to {format_iso_date(end_dt)}")
-            logger.info(f"ℹ️  ETL Server Timezone: UTC")
-            logger.info("")
-            
-            # Process each date range with progress bar
-            for from_date, to_date in tqdm(date_ranges, desc="Processing date ranges", unit="range"):
-                # Process the chunk (will check for schema evolution and process data)
-                self.process_date_range(from_date, to_date, table_columns)
+
+            # Process each crime_id with progress bar
+            for crime_id in tqdm(crime_ids, desc="Processing crime_ids", unit="crime"):
+                self.process_crime_id(crime_id, table_columns)
                 time.sleep(1)  # Be nice to the API
             
             # Get database counts
