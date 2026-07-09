@@ -583,6 +583,16 @@ class CrimesETL:
             'date_modified': crime_raw.get('DATE_MODIFIED')
         }
 
+        # API sometimes sends "" instead of omitting an optional date -- "" is
+        # not a valid timestamp for Postgres, so treat it the same as missing.
+        for date_column in (
+            'fir_date', 'gd_entry_date', 'occurrence_from_date',
+            'occurrence_prior_to_date', 'occurrence_to_date',
+            'date_created', 'date_modified',
+        ):
+            if transformed.get(date_column) == '':
+                transformed[date_column] = None
+
         logger.trace(f"Transformed crime: {json.dumps(transformed, indent=2, default=str)}")
         return transformed
     
