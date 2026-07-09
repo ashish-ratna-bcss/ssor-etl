@@ -12,7 +12,7 @@ Master injects into child subprocess env:
   ETL_TO_DATE    = YYYY-MM-DD
 
 KB tables preserved on RESTART (never truncated):
-  geo_countries, geo_reference, drug_categories, drug_ignore_list
+  geo_countries, geo_reference, drug_categories, drug_ignore_list, ssor_kb
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from psycopg2 import sql
 
 IST = timezone(timedelta(hours=5, minutes=30))
 ABSOLUTE_ORIGIN = "2022-01-01"
-KB_PRESERVE_TABLES = frozenset({"geo_countries", "geo_reference", "drug_categories", "drug_ignore_list"})
+KB_PRESERVE_TABLES = frozenset({"geo_countries", "geo_reference", "drug_categories", "drug_ignore_list", "ssor_kb"})
 
 
 def _yesterday_ist() -> str:
