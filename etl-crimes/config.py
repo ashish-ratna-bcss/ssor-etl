@@ -60,6 +60,7 @@ def _table_name(env_key: str, default: str) -> str:
 
 TABLE_CONFIG = {
     'crimes': _table_name('CRIMES_TABLE', 'crimes'),
+    'ssor_kb': _table_name('SSOR_KB_TABLE', 'ssor_kb'),
     'accused': _table_name('ACCUSED_TABLE', 'accused'),
     'persons': _table_name('PERSONS_TABLE', 'persons'),
     'hierarchy': _table_name('HIERARCHY_TABLE', 'hierarchy'),

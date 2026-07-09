@@ -7,7 +7,17 @@
       "Bash(python3 -m py_compile etl-crimes/etl_crimes.py)",
       "Bash(python3 -m py_compile /home/ashish-ratna/CCTNS-ETL/etl_mo_seizures/etl_mo_seizure.py)",
       "Bash(python3 -m py_compile etl-persons/etl_persons.py)",
-      "Bash(python3 -m py_compile etl-crimes/etl_crimes.py etl_mo_seizures/etl_mo_seizure.py etl-persons/etl_persons.py)"
+      "Bash(python3 -m py_compile etl-crimes/etl_crimes.py etl_mo_seizures/etl_mo_seizure.py etl-persons/etl_persons.py)",
+      "Bash(git checkout *)",
+      "Bash(python3 -c \"import pytest\")",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=6 sodb-177 \"hostname; whoami; uname -a\")",
+      "Bash(ssh sodb-177 *)",
+      "Bash(scp /home/ashish-ratna/CCTNS-ETL/docker-compose.yml /home/ashish-ratna/CCTNS-ETL/DB-schema.sql sodb-177:~/cctns-etl-db/)",
+      "Bash(PGPASSWORD=cctnsbcss2026 psql -h 10.121.9.177 -p 5432 -U cctns_prod -d cctns_etl -c \"SELECT count\\(*\\) AS tables FROM information_schema.tables WHERE table_schema='public';\")",
+      "Bash(PGPASSWORD=cctnsbcss2026 psql -h 10.121.9.177 -p 5432 -U cctns_prod -d cctns_etl -f /home/ashish-ratna/CCTNS-ETL/ssor-register/migrations/001_create_ssor_kb.sql)",
+      "Bash(PGPASSWORD=cctnsbcss2026 psql -h 10.121.9.177 -p 5432 -U cctns_prod -d cctns_etl -c \"SELECT tier, count\\(*\\) FROM ssor_kb GROUP BY tier ORDER BY tier;\")",
+      "Bash(PGPASSWORD=cctnsbcss2026 psql -h 10.121.9.177 -p 5432 -U cctns_prod -d cctns_etl -c \"SELECT act_name, section_code, tier FROM ssor_kb ORDER BY severity_rank DESC, act_name, section_code;\")",
+      "Bash(curl -s -m 10 http://10.20.2.211:3001/doc/openapi)"
     ]
   }
 }

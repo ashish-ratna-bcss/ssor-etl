@@ -16,8 +16,11 @@ import os
 import json
 
 # Import PostgreSQLConnectionPool
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
+sys.path.append(os.path.join(PROJECT_ROOT, 'ssor-register'))
 from db_pooling import PostgreSQLConnectionPool
+from section_matcher import extract_sections
 
 from tqdm import tqdm
 import logging
@@ -69,6 +72,11 @@ else:
 # Target tables (allows redirecting ETL into test tables)
 CRIMES_TABLE = TABLE_CONFIG.get('crimes', 'crimes')
 HIERARCHY_TABLE = TABLE_CONFIG.get('hierarchy', 'hierarchy')
+# SSOR branch: only crimes whose ACTS_SECTIONS matches a row in ssor_kb are
+# ever inserted -- every downstream ETL (accused, persons, IR, chargesheets,
+# ...) reads its worklist off this table, so filtering here filters the
+# whole pipeline.
+SSOR_KB_TABLE = TABLE_CONFIG.get('ssor_kb', 'ssor_kb')
 
 # IST timezone offset (UTC+05:30)
 IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
@@ -115,6 +123,7 @@ class CrimesETL:
         self.db_pool = None
         self.stats_lock = threading.Lock()
         self.schema_lock = threading.Lock()
+        self.ssor_kb_pairs: Set[Tuple[str, str]] = set()
         self.stats = {
             'total_api_calls': 0,
             'total_crimes_fetched': 0,
@@ -122,13 +131,14 @@ class CrimesETL:
             'total_crimes_updated': 0,
             'total_crimes_no_change': 0,
             'total_crimes_skipped': 0,
+            'total_crimes_skipped_non_ssor': 0,
             'total_crimes_failed': 0,
             'total_crimes_failed_ps_code': 0,
             'total_duplicates': 0,
             'failed_api_calls': 0,
             'errors': []
         }
-        
+
         self.setup_chunk_loggers()
     
     def setup_chunk_loggers(self):
@@ -242,7 +252,21 @@ class CrimesETL:
         except Exception as e:
             logger.error(f"Error getting table columns for {table_name}: {e}")
             return set()
-    
+
+    def load_ssor_kb(self) -> None:
+        """Load the SSOR section knowledge-base once at startup. Read-only
+        after this, so safe to share across the ThreadPoolExecutor workers."""
+        with self.db_pool.get_connection_context() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT act_name, section_code FROM {SSOR_KB_TABLE}")
+            self.ssor_kb_pairs = {(act, section) for act, section in cursor.fetchall()}
+        logger.info(f"📚 Loaded {len(self.ssor_kb_pairs)} sections from {SSOR_KB_TABLE}")
+
+    def matches_ssor_kb(self, acts_sections: Optional[str]) -> bool:
+        """True if any (act, section) parsed out of ACTS_SECTIONS is in
+        ssor_kb -- this crime is in scope for the women's wing register."""
+        return any(pair in self.ssor_kb_pairs for pair in extract_sections(acts_sections or ''))
+
     def get_effective_start_date(self) -> str:
         """Get effective start date for ETL"""
         force_start = os.environ.get('FORCE_START_DATE')
@@ -992,7 +1016,12 @@ class CrimesETL:
                     failed_reasons[reason] = []
                 failed_reasons[reason].append(None)
                 continue
-            
+
+            if not self.matches_ssor_kb(crime.get('acts_sections')):
+                with self.stats_lock:
+                    self.stats['total_crimes_skipped_non_ssor'] += 1
+                continue
+
             if crime_id in seen_crime_ids:
                 occurrence_count = crime_id_occurrences.get(crime_id, 1) + 1
                 crime_id_occurrences[crime_id] = occurrence_count
@@ -1174,9 +1203,10 @@ class CrimesETL:
             return False
         
         try:
+            self.load_ssor_kb()
             effective_start_date = self.get_effective_start_date()
             logger.info(f"Effective Start Date: {effective_start_date}")
-            
+
             table_columns = self.get_table_columns(CRIMES_TABLE)
             
             date_ranges = self.generate_date_ranges(
@@ -1236,6 +1266,7 @@ class CrimesETL:
             logger.info(f"")
             logger.info(f"📥 FROM API:")
             logger.info(f"  Total Crimes Fetched: {self.stats['total_crimes_fetched']}")
+            logger.info(f"  Skipped (non-SSOR):   {self.stats['total_crimes_skipped_non_ssor']}")
             logger.info(f"")
             logger.info(f"💾 TO DATABASE:")
             logger.info(f"  Total Inserted (New): {self.stats['total_crimes_inserted']}")
