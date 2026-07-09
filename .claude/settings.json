@@ -3,7 +3,11 @@
     "allow": [
       "Bash(curl -s -m 8 http://10.20.2.211:3001/doc)",
       "Bash(curl -s -m 8 http://10.20.2.211:3001/doc/openapi -o /tmp/claude-1000/-home-ashish-ratna-CCTNS-ETL/0c8dd994-48b3-4ba7-99dd-eab67f839cf8/scratchpad/openapi.json)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m py_compile etl-crimes/etl_crimes.py)",
+      "Bash(python3 -m py_compile /home/ashish-ratna/CCTNS-ETL/etl_mo_seizures/etl_mo_seizure.py)",
+      "Bash(python3 -m py_compile etl-persons/etl_persons.py)",
+      "Bash(python3 -m py_compile etl-crimes/etl_crimes.py etl_mo_seizures/etl_mo_seizure.py etl-persons/etl_persons.py)"
     ]
   }
 }
