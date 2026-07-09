@@ -1284,27 +1284,23 @@ class PersonsETL:
         
         return rows
 
-    def get_person_ids_for_window(self, from_date: str, to_date: str) -> List[str]:
-        """
-        Get distinct person IDs from accused records changed in a date window.
-        Date window is inclusive and uses accused.date_created/date_modified.
-        """
-        from_dt = parse_iso_date(from_date)
-        to_dt = parse_iso_date(to_date)
-
+    def pending_person_ids(self) -> List[str]:
+        """Distinct person_ids already in accused but not yet enriched in
+        persons -- SSOR branch: persons is driven off accused, not an
+        independent date-range window (get_person_ids_for_window replaced;
+        stub rows accused.ensure_person_stub creates have full_name IS NULL
+        until this fetch enriches them)."""
         with self.db_pool.get_connection_context() as conn:
             cursor = conn.cursor()
             cursor.execute(f"""
                 SELECT DISTINCT a.person_id
                 FROM {ACCUSED_TABLE} a
                 WHERE a.person_id IS NOT NULL
-                  AND (
-                    (a.date_created IS NOT NULL AND a.date_created >= %s AND a.date_created <= %s)
-                    OR
-                    (a.date_modified IS NOT NULL AND a.date_modified >= %s AND a.date_modified <= %s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {PERSONS_TABLE} p
+                      WHERE p.person_id = a.person_id AND p.full_name IS NOT NULL
                   )
-            """, (from_dt, to_dt, from_dt, to_dt))
-
+            """)
             return [r[0] for r in cursor.fetchall()]
 
     def generate_date_ranges(self, start_date: str, end_date: str, chunk_days: int = 5, overlap_days: int = 1) -> List[Tuple[str, str]]:
@@ -1330,18 +1326,16 @@ class PersonsETL:
 
         return date_ranges
 
-    def fetch_person_api(self, person_id: str, from_date: str, to_date: str) -> Optional[Dict]:
+    def fetch_person_api(self, person_id: str) -> Optional[Dict]:
+        """GET /person-details/{personId} -- personId-keyed, no date params
+        per the API spec (SSOR branch: driven off accused.person_id)."""
         url = f"{API_CONFIG['base_url']}/person-details/{person_id}"
-        params = {
-            'fromDate': from_date,
-            'toDate': to_date
-        }
         headers = {'x-api-key': API_CONFIG['api_key']}
-        
+
         for attempt in range(API_CONFIG['max_retries']):
             try:
                 logger.debug(f"Fetching person details for {person_id} (Attempt {attempt + 1})")
-                resp = requests.get(url, params=params, headers=headers, timeout=API_CONFIG['timeout'])
+                resp = requests.get(url, headers=headers, timeout=API_CONFIG['timeout'])
                 
                 if resp.status_code == 200:
                     data = resp.json()
@@ -1609,10 +1603,6 @@ class PersonsETL:
                         %s,%s,%s,%s,
                         %s,%s,
                         %s,%s,%s,
-                        %s,%s,%s,
-                        %s,%s,%s,%s,
-                        %s,%s,
-                        %s,%s,%s,
                         %s, %s
                     )
                     """,
@@ -1725,42 +1715,19 @@ class PersonsETL:
                 self.correct_heuristic_gender_records(dry_run=True)
             # ──────────────────────────────────────────────────────────────────
             
-            last_date = self.get_last_processed_date()
-            checkpoint_date = self.get_run_checkpoint('persons')
-            resume_boundary = last_date
-            if checkpoint_date:
-                checkpoint_dt = parse_iso_date(checkpoint_date) if isinstance(checkpoint_date, str) else checkpoint_date
-                if resume_boundary is None or checkpoint_dt > resume_boundary:
-                    resume_boundary = checkpoint_dt
+            person_ids = self.pending_person_ids()
+            logger.info(f"📊 Found {len(person_ids)} person_ids pending enrichment (from accused)")
 
-            effective_start_date = resume_boundary.isoformat() if resume_boundary else '2022-01-01T00:00:00+05:30'
-            calculated_end_date = get_yesterday_end_ist()
-
-            chunk_days = int(os.environ.get('CHUNK_DAYS', '5'))
-            overlap_days = int(os.environ.get('CHUNK_OVERLAP_DAYS', '1'))
-
-            date_ranges = self.generate_date_ranges(
-                effective_start_date,
-                calculated_end_date,
-                chunk_days,
-                overlap_days
-            )
-
-            logger.info(f"Date Range: {effective_start_date} to {calculated_end_date}")
-            logger.info(f"Chunk Size: {chunk_days} days (overlap: {overlap_days} day(s))")
-
-            if not date_ranges:
-                logger.info("ℹ️  No date ranges to process. Nothing to do.")
+            if not person_ids:
+                logger.info("ℹ️  No pending person_ids to process. Nothing to do.")
                 return True
 
-            processed_person_ids = set()
-            
             batch_size = 100  # Log batch stats every 100 records
             first_record_processed = False
-            
-            def process_person(pid, table_columns, from_date, to_date):
+
+            def process_person(pid, table_columns):
                 nonlocal first_record_processed
-                data = self.fetch_person_api(pid, from_date, to_date)
+                data = self.fetch_person_api(pid)
                 if data:
                     # Check for schema evolution on first record with minimal lock contention
                     if not first_record_processed and table_columns is not None and not self.person_gender_dry_run:
@@ -1801,44 +1768,34 @@ class PersonsETL:
             requested_workers = int(os.environ.get('MAX_WORKERS', min(32, (os.cpu_count() or 1) * 4)))
             max_workers = compute_safe_workers(self.db_pool, requested_workers)
 
-            for from_date, to_date in tqdm(date_ranges, desc="Processing date ranges", unit="range"):
-                window_person_ids = self.get_person_ids_for_window(from_date, to_date)
-                window_person_ids = [pid for pid in window_person_ids if pid not in processed_person_ids]
+            with self.stats_lock:
+                self.stats['person_ids'] += len(person_ids)
 
-                if not window_person_ids:
-                    continue
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(process_person, pid, table_columns): pid
+                    for pid in person_ids
+                }
 
-                for pid in window_person_ids:
-                    processed_person_ids.add(pid)
+                with tqdm(total=len(person_ids), desc="Processing person_ids", unit="person") as pbar:
+                    for idx, future in enumerate(as_completed(futures), 1):
+                        pid = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"Error processing person {pid}: {e}")
+                            with self.stats_lock:
+                                self.stats['failed'] += 1
+                                self.stats['errors'] += 1
 
-                with self.stats_lock:
-                    self.stats['person_ids'] += len(window_person_ids)
-
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(process_person, pid, table_columns, from_date, to_date): pid
-                        for pid in window_person_ids
-                    }
-
-                    with tqdm(total=len(window_person_ids), desc=f"Persons {from_date} to {to_date}", unit="person", leave=False) as pbar:
-                        for idx, future in enumerate(as_completed(futures), 1):
-                            pid = futures[future]
-                            try:
-                                future.result()
-                            except Exception as e:
-                                logger.error(f"Error processing person {pid}: {e}")
-                                with self.stats_lock:
-                                    self.stats['failed'] += 1
-                                    self.stats['errors'] += 1
-
-                            pbar.update(1)
-                            if idx % batch_size == 0:
-                                with self.stats_lock:
-                                    logger.info(
-                                        f"   📊 Progress ({from_date} to {to_date}): {idx}/{len(window_person_ids)} - "
-                                        f"Inserted: {self.stats['inserted']}, Updated: {self.stats['updated']}, "
-                                        f"Failed: {self.stats['failed']}"
-                                    )
+                        pbar.update(1)
+                        if idx % batch_size == 0:
+                            with self.stats_lock:
+                                logger.info(
+                                    f"   📊 Progress: {idx}/{len(person_ids)} - "
+                                    f"Inserted: {self.stats['inserted']}, Updated: {self.stats['updated']}, "
+                                    f"Failed: {self.stats['failed']}"
+                                )
 
             # Get database counts
             with self.db_pool.get_connection_context() as conn:
@@ -1877,8 +1834,6 @@ class PersonsETL:
                 logger.info(f"  Would Insert:             {self.stats['dry_run_inserts']}")
                 logger.info(f"  Would Update:             {self.stats['dry_run_changes']}")
                 logger.info(f"  No Change:                {self.stats['dry_run_no_change']}")
-            else:
-                self.update_run_checkpoint('persons', calculated_end_date)
             logger.info("=" * 80)
             logger.info("✅ ETL Pipeline completed successfully!")
             return True
