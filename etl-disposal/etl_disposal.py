@@ -402,7 +402,19 @@ class DisposalETL:
         except Exception as e:
             logger.error(f"Error getting table columns for {table_name}: {e}")
             return set()
-    
+
+    def pending_crime_ids(self, cursor) -> List[str]:
+        """crime_ids already in crimes but with no disposal rows fetched yet
+        -- SSOR branch: disposal is driven off crimes (GET
+        /crimes/disposal/{crimeId}), not an independent date-range scan."""
+        cursor.execute(f"""
+            SELECT c.crime_id FROM {CRIMES_TABLE} c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {DISPOSAL_TABLE} d WHERE d.crime_id = c.crime_id
+            )
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
     def get_effective_start_date(self) -> str:
         """
         Get effective start date for ETL:
@@ -713,8 +725,60 @@ class DisposalETL:
         logger.error(f"❌ Failed to fetch disposal for {from_date} to {to_date} after {API_CONFIG['max_retries']} attempts (max timeout was {adaptive_timeout}s)")
         self.log_api_chunk(from_date, to_date, 0, [], [], error=f"Failed after {API_CONFIG['max_retries']} attempts (timeout={adaptive_timeout}s)")
         return None
-    
-    def log_api_chunk(self, from_date: str, to_date: str, count: int, crime_ids: List[str], 
+
+    def fetch_disposal_by_crime_id(self, crime_id: str) -> Optional[List[Dict]]:
+        """GET /crimes/disposal/{crimeId} -- SSOR branch: disposal is driven
+        off crimes, not an independent date-range scan."""
+        url = f"{API_CONFIG['base_url']}/crimes/disposal/{crime_id}"
+        headers = {'x-api-key': API_CONFIG['api_key']}
+        base_timeout = API_CONFIG.get('timeout', 30)
+
+        for attempt in range(API_CONFIG['max_retries']):
+            try:
+                adaptive_timeout = base_timeout + (attempt * 15)
+                logger.debug(f"Fetching disposal for crime_id {crime_id} (Attempt {attempt + 1})")
+                response = requests.get(url, headers=headers, timeout=adaptive_timeout)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    self.stats['total_api_calls'] += 1
+
+                    if data.get('status'):
+                        disposal_data = data.get('data')
+                        if disposal_data:
+                            if isinstance(disposal_data, dict):
+                                disposal_data = [disposal_data]
+                            logger.info(f"✅ Fetched {len(disposal_data)} disposal records for crime_id {crime_id}")
+                            return disposal_data
+                        else:
+                            logger.warning(f"⚠️  No disposal records found for crime_id {crime_id}")
+                            return []
+                    else:
+                        logger.warning(f"⚠️  API returned status=false for crime_id {crime_id}")
+                        return []
+
+                elif response.status_code == 404:
+                    logger.info(f"ℹ️  No disposal found for crime_id {crime_id} (404)")
+                    return []
+
+                else:
+                    logger.warning(f"API returned status code {response.status_code} for crime_id {crime_id}, retrying...")
+                    time.sleep(min(2 ** attempt, 30))
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"API timeout for crime_id {crime_id}, retrying... (Attempt {attempt + 1})")
+                time.sleep(min(2 ** attempt, 30))
+            except Exception as e:
+                logger.error(f"API error for crime_id {crime_id}: {e}")
+                if attempt == API_CONFIG['max_retries'] - 1:
+                    self.stats['failed_api_calls'] += 1
+                    self.stats['errors'].append(f"crime_id {crime_id}: {str(e)}")
+                time.sleep(min(2 ** attempt, 30))
+
+        logger.error(f"❌ Failed to fetch disposal for crime_id {crime_id} after {API_CONFIG['max_retries']} attempts")
+        return None
+
+    def log_api_chunk(self, from_date: str, to_date: str, count: int, crime_ids: List[str],
                      disposal_data: List[Dict], error: Optional[str] = None):
         """Log API response for a chunk"""
         chunk_info = {
@@ -1184,24 +1248,27 @@ class DisposalETL:
             with self.stats_lock:
                 self.stats['total_disposals_failed'] += 1
     
-    def process_date_range(self, from_date: str, to_date: str, table_columns: Set[str] = None):
-        """Process disposal records for a specific date range"""
-        chunk_range = f"{from_date} to {to_date}"
+    def process_crime_id(self, crime_id: str, table_columns: Set[str] = None):
+        """Process disposal records for a single crime_id (GET
+        /crimes/disposal/{crimeId}) -- SSOR branch: driven off crimes. Log
+        helpers below only use from_date/to_date as display labels."""
+        from_date = to_date = f"crime_id={crime_id}"
+        chunk_range = from_date
         logger.info(f"📅 Processing: {chunk_range}")
-        
+
         # Fetch disposal from API
-        disposal_raw = self.fetch_disposal_api(from_date, to_date)
-        
+        disposal_raw = self.fetch_disposal_by_crime_id(crime_id)
+
         if disposal_raw is None:
             logger.error(f"❌ Failed to fetch disposal for {chunk_range}")
             self.log_db_chunk(from_date, to_date, 0, [], [], [], [], [], error="API fetch failed")
             return
-        
+
         if not disposal_raw:
             logger.info(f"ℹ️  No disposal records found for {chunk_range}")
             self.log_db_chunk(from_date, to_date, 0, [], [], [], [], [], error="No disposal records in API response")
             return
-        
+
         # Check for schema evolution if we got data
         if table_columns is not None and len(disposal_raw) > 0:
             # Check for new fields in first record
@@ -1214,8 +1281,8 @@ class DisposalETL:
                         # Update table_columns set
                         table_columns.add(db_column)
                 # Update existing records from start_date to current chunk end_date
-                self.update_existing_records_with_new_fields(new_fields, to_date)
-        
+                self.update_existing_records_with_new_fields(new_fields, crime_id)
+
         # Transform and insert each disposal
         with self.stats_lock:
             self.stats['total_disposals_fetched'] += len(disposal_raw)
@@ -1326,35 +1393,33 @@ class DisposalETL:
             
             self.db_log.flush()
 
-    def _process_chunk_worker(self, from_date: str, to_date: str, table_columns: Set[str], result_queue, worker_id: int):
-        """Worker thread for processing individual date range chunks in parallel"""
-        chunk_range = f"{from_date} to {to_date}"
+    def _process_crime_id_worker(self, crime_id: str, table_columns: Set[str], result_queue, worker_id: int):
+        """Worker thread for processing individual crime_ids in parallel."""
         try:
-            logger.debug(f"⚡ Worker {worker_id} processing: {chunk_range}")
-            self.process_date_range(from_date, to_date, table_columns)
+            logger.debug(f"⚡ Worker {worker_id} processing: crime_id={crime_id}")
+            self.process_crime_id(crime_id, table_columns)
             result_queue.append({
                 'worker_id': worker_id,
-                'chunk': chunk_range,
+                'crime_id': crime_id,
                 'success': True,
                 'error': None
             })
         except Exception as e:
-            logger.error(f"❌ Worker {worker_id} failed for {chunk_range}: {e}")
+            logger.error(f"❌ Worker {worker_id} failed for crime_id={crime_id}: {e}")
             result_queue.append({
                 'worker_id': worker_id,
-                'chunk': chunk_range,
+                'crime_id': crime_id,
                 'success': False,
                 'error': str(e)
             })
 
-    def process_date_ranges_parallel(self, date_ranges: List[Tuple[str, str]], table_columns: Set[str]):
-        """Orchestrate parallel chunk processing with error recovery and monitoring"""
-        import queue
-
+    def process_crime_ids_parallel(self, crime_ids: List[str], table_columns: Set[str]):
+        """Orchestrate parallel crime_id processing with error recovery and
+        monitoring -- SSOR branch: driven off crimes, not date-range chunks."""
         # Determine optimal worker count (disposal-specific or global setting)
         chunk_workers = min(
             int(os.environ.get('DISPOSAL_CHUNK_PARALLEL_WORKERS', os.environ.get('CHUNK_PARALLEL_WORKERS', 4))),
-            len(date_ranges)  # Don't create more workers than chunks
+            len(crime_ids) or 1
         )
 
         # Verify pool can handle parallel workers (reserve 5 connections for metadata ops)
@@ -1364,51 +1429,49 @@ class DisposalETL:
                 logger.warning(f"⚠️  Reducing workers from {chunk_workers} to {max_pool_workers} (pool capacity limit)")
                 chunk_workers = max(1, max_pool_workers)
 
-        logger.info(f"⚡ Starting parallel chunk processing ({len(date_ranges)} chunks)")
+        logger.info(f"⚡ Starting parallel crime_id processing ({len(crime_ids)} crime_ids)")
         logger.info(f"🔄 Parallel workers: {chunk_workers} (max_pool_workers={max_pool_workers if self.db_pool else 'unknown'})")
         logger.info("")
 
-        failed_chunks = []
+        failed_crime_ids = []
         processed = 0
 
         with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
             result_queue = []
             futures = {}
 
-            # Submit all chunks to executor
-            for worker_id, (from_date, to_date) in enumerate(date_ranges, 1):
+            for worker_id, crime_id in enumerate(crime_ids, 1):
                 future = executor.submit(
-                    self._process_chunk_worker,
-                    from_date, to_date, table_columns, result_queue, worker_id
+                    self._process_crime_id_worker,
+                    crime_id, table_columns, result_queue, worker_id
                 )
-                futures[future] = (from_date, to_date)
+                futures[future] = crime_id
 
-            # Monitor progress with progress bar
-            with tqdm(total=len(date_ranges), desc="Processing chunks", unit="chunk") as pbar:
+            with tqdm(total=len(crime_ids), desc="Processing crime_ids", unit="crime") as pbar:
                 for future in as_completed(futures):
                     try:
                         result = future.result()
                     except Exception as e:
-                        from_date, to_date = futures[future]
-                        logger.error(f"❌ Future failed for {from_date} to {to_date}: {e}")
-                        failed_chunks.append((from_date, to_date, str(e)))
+                        crime_id = futures[future]
+                        logger.error(f"❌ Future failed for crime_id={crime_id}: {e}")
+                        failed_crime_ids.append((crime_id, str(e)))
 
                     processed += 1
                     pbar.update(1)
 
-        # Queue failed chunks for sequential retry with exponential backoff
-        if failed_chunks:
-            logger.warning(f"⚠️  {len(failed_chunks)} chunks failed, queuing for sequential retry")
-            for attempt, (from_date, to_date, error) in enumerate(failed_chunks, 1):
+        # Retry failed crime_ids sequentially with exponential backoff
+        if failed_crime_ids:
+            logger.warning(f"⚠️  {len(failed_crime_ids)} crime_ids failed, queuing for sequential retry")
+            for attempt, (crime_id, error) in enumerate(failed_crime_ids, 1):
                 retry_delay = 0.5 * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s, 8s...
-                logger.info(f"🔄 Retrying {attempt}/{len(failed_chunks)}: {from_date} to {to_date} (delay={retry_delay:.1f}s)")
+                logger.info(f"🔄 Retrying {attempt}/{len(failed_crime_ids)}: crime_id={crime_id} (delay={retry_delay:.1f}s)")
                 time.sleep(retry_delay)
                 try:
-                    self.process_date_range(from_date, to_date, table_columns)
+                    self.process_crime_id(crime_id, table_columns)
                 except Exception as e:
-                    logger.error(f"❌ Retry failed for {from_date} to {to_date}: {e}")
+                    logger.error(f"❌ Retry failed for crime_id={crime_id}: {e}")
 
-        logger.info(f"✅ Chunk processing complete: {processed}/{len(date_ranges)} successful")
+        logger.info(f"✅ Crime_id processing complete: {processed}/{len(crime_ids)} successful")
 
     def write_log_summaries(self):
         """Write summary sections to all log files"""
@@ -1595,46 +1658,24 @@ class DisposalETL:
         logger.info(f"Calculated End Date: {calculated_end_date}")
         
         try:
-            # Get effective start date (check if table has data, or use API_DATA_START_DATE)
-            effective_start_date = self.get_effective_start_date()
-            checkpoint_date = self.get_run_checkpoint('disposal')
-            if checkpoint_date:
-                checkpoint_iso = checkpoint_date if isinstance(checkpoint_date, str) else checkpoint_date.isoformat()
-                if parse_iso_date(checkpoint_iso) > parse_iso_date(effective_start_date):
-                    effective_start_date = checkpoint_iso
-
-            logger.info(f"Effective Start Date (for this run): {effective_start_date}")
-            
             # Get table columns for schema evolution
             table_columns = self.get_table_columns(DISPOSAL_TABLE)
             logger.debug(f"Existing table columns: {sorted(table_columns)}")
-            
-            # Generate date ranges with overlap to ensure no data is missed
-            date_ranges = self.generate_date_ranges(
-                effective_start_date,
-                calculated_end_date,
-                ETL_CONFIG['chunk_days'],
-                ETL_CONFIG.get('chunk_overlap_days', 1)  # Default to 1 day overlap for safety
-            )
-            
-            logger.info(f"Date Range: {effective_start_date} to {calculated_end_date}")
-            overlap_days = ETL_CONFIG.get('chunk_overlap_days', 1)
-            logger.info(f"Chunk Size: {ETL_CONFIG['chunk_days']} days (overlap: {overlap_days} day(s) to ensure no data loss)")
-            logger.info(f"API Min Date: {API_DATA_START_DATE} (earliest data available from API)")
+
+            # SSOR branch: disposal is driven off crime_ids already in
+            # crimes (GET /crimes/disposal/{crimeId}), not an independent
+            # date-range scan -- resumability comes from pending_crime_ids'
+            # NOT EXISTS check, not a date checkpoint.
+            with self.db_pool.get_connection_context() as conn:
+                with conn.cursor() as cursor:
+                    crime_ids = self.pending_crime_ids(cursor)
+
+            logger.info(f"📊 Found {len(crime_ids)} crime_ids pending disposal fetch")
             logger.info("=" * 80)
-            
-            logger.info(f"📊 Total date ranges to process: {len(date_ranges)}")
-            logger.debug(f"Generated date ranges: {date_ranges[:5]}{'...' if len(date_ranges) > 5 else ''} (showing first 5)")
-            logger.info("")
-            start_dt = parse_iso_date(effective_start_date)
-            end_dt = parse_iso_date(calculated_end_date)
-            logger.info(f"ℹ️  API Server Timezone: IST (UTC+05:30)")
-            logger.info(f"ℹ️  Date Range: {format_iso_date(start_dt)} to {format_iso_date(end_dt)}")
-            logger.info(f"ℹ️  ETL Server Timezone: UTC")
             logger.info("")
 
-            # Process each date range in parallel for significant speedup
-            self.process_date_ranges_parallel(date_ranges, table_columns)
+            # Process each crime_id in parallel for significant speedup
+            self.process_crime_ids_parallel(crime_ids, table_columns)
             
             # Get database counts
             with self.db_pool.get_connection_context() as conn:

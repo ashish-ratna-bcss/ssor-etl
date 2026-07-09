@@ -326,7 +326,19 @@ class ArrestsETL:
         except Exception as e:
             logger.error(f"Error getting table columns for {table_name}: {e}")
             return set()
-    
+
+    def pending_crime_ids(self, cursor) -> List[str]:
+        """crime_ids already in crimes but with no arrests rows fetched yet
+        -- SSOR branch: arrests is driven off crimes (GET
+        /arrests/{crimeId}), not an independent date-range scan."""
+        cursor.execute(f"""
+            SELECT c.crime_id FROM {CRIMES_TABLE} c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {ARRESTS_TABLE} a WHERE a.crime_id = c.crime_id
+            )
+        """)
+        return [row[0] for row in cursor.fetchall()]
+
     def get_effective_start_date(self) -> str:
         """
         Get effective start date for ETL:
@@ -627,6 +639,56 @@ class ArrestsETL:
         
         logger.error(f"❌ Failed to fetch arrests for {from_date} to {to_date} after {API_CONFIG['max_retries']} attempts")
         self.log_api_chunk(from_date, to_date, 0, [], [], error="Failed after max retries")
+        return None
+
+    def fetch_arrests_by_crime_id(self, crime_id: str) -> Optional[List[Dict]]:
+        """GET /arrests/{crimeId} -- SSOR branch: arrests is driven off
+        crimes, not an independent date-range scan."""
+        url = f"{API_CONFIG['base_url']}/arrests/{crime_id}"
+        headers = {'x-api-key': API_CONFIG['api_key']}
+
+        for attempt in range(API_CONFIG['max_retries']):
+            try:
+                logger.debug(f"Fetching arrests for crime_id {crime_id} (Attempt {attempt + 1})")
+                response = requests.get(url, headers=headers, timeout=API_CONFIG['timeout'])
+
+                if response.status_code == 200:
+                    data = response.json()
+                    self.stats['total_api_calls'] += 1
+
+                    if data.get('status'):
+                        arrests_data = data.get('data')
+                        if arrests_data:
+                            if isinstance(arrests_data, dict):
+                                arrests_data = [arrests_data]
+                            logger.info(f"✅ Fetched {len(arrests_data)} arrests records for crime_id {crime_id}")
+                            return arrests_data
+                        else:
+                            logger.warning(f"⚠️  No arrests records found for crime_id {crime_id}")
+                            return []
+                    else:
+                        logger.warning(f"⚠️  API returned status=false for crime_id {crime_id}")
+                        return []
+
+                elif response.status_code == 404:
+                    logger.warning(f"⚠️  No arrests found for crime_id {crime_id} (404)")
+                    return []
+
+                else:
+                    logger.warning(f"API returned status code {response.status_code} for crime_id {crime_id}, retrying...")
+                    time.sleep(2 ** attempt)
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"API timeout for crime_id {crime_id}, retrying... (Attempt {attempt + 1})")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                logger.error(f"API error for crime_id {crime_id}: {e}")
+                if attempt == API_CONFIG['max_retries'] - 1:
+                    self.stats['failed_api_calls'] += 1
+                    self.stats['errors'].append(f"crime_id {crime_id}: {str(e)}")
+                time.sleep(2 ** attempt)
+
+        logger.error(f"❌ Failed to fetch arrests for crime_id {crime_id} after {API_CONFIG['max_retries']} attempts")
         return None
     
     def log_api_chunk(self, from_date: str, to_date: str, count: int, crime_ids: List[str], 
@@ -1295,24 +1357,27 @@ class ArrestsETL:
             with self.stats_lock:
                 self.stats['total_arrests_failed'] += 1
     
-    def process_date_range(self, from_date: str, to_date: str, table_columns: Set[str] = None):
-        """Process arrests records for a specific date range"""
-        chunk_range = f"{from_date} to {to_date}"
+    def process_crime_id(self, crime_id: str, table_columns: Set[str] = None):
+        """Process arrests records for a single crime_id (GET
+        /arrests/{crimeId}) -- SSOR branch: driven off crimes. Log helpers
+        below only use from_date/to_date as display labels."""
+        from_date = to_date = f"crime_id={crime_id}"
+        chunk_range = from_date
         logger.info(f"📅 Processing: {chunk_range}")
-        
+
         # Fetch arrests from API
-        arrests_raw = self.fetch_arrests_api(from_date, to_date)
-        
+        arrests_raw = self.fetch_arrests_by_crime_id(crime_id)
+
         if arrests_raw is None:
             logger.error(f"❌ Failed to fetch arrests for {chunk_range}")
             self.log_db_chunk(from_date, to_date, 0, [], [], [], [], [], error="API fetch failed")
             return
-        
+
         if not arrests_raw:
             logger.info(f"ℹ️  No arrests records found for {chunk_range}")
             self.log_db_chunk(from_date, to_date, 0, [], [], [], [], [], error="No arrests records in API response")
             return
-        
+
         # Check for schema evolution if we got data
         if table_columns is not None and len(arrests_raw) > 0:
             # Check for new fields in first record
@@ -1325,8 +1390,8 @@ class ArrestsETL:
                         # Update table_columns set
                         table_columns.add(db_column)
                 # Update existing records from start_date to current chunk end_date
-                self.update_existing_records_with_new_fields(new_fields, to_date)
-        
+                self.update_existing_records_with_new_fields(new_fields, crime_id)
+
         # Transform and insert each arrests
         with self.stats_lock:
             self.stats['total_arrests_fetched'] += len(arrests_raw)
@@ -1525,23 +1590,21 @@ class ArrestsETL:
             success, _ = self.insert_arrests(record, conn, cur, 'FK_RETRY')
             return success
 
-    def _process_chunk_worker(self, from_date: str, to_date: str, table_columns: Set[str],
+    def _process_crime_id_worker(self, crime_id: str, table_columns: Set[str],
                               result_queue: queue.Queue, progress_lock: threading.Lock,
                               pbar_dict: Dict, worker_id: int) -> bool:
-        """Worker thread for processing a single date range chunk.
+        """Worker thread for processing a single crime_id.
 
         Returns True on success, False on failure.
         """
-        chunk_range = f"{from_date} to {to_date}"
         try:
-            logger.debug(f"[Worker {worker_id}] START chunk: {chunk_range}")
+            logger.debug(f"[Worker {worker_id}] START crime_id={crime_id}")
             start_time = time.time()
 
-            # Process the chunk
-            self.process_date_range(from_date, to_date, table_columns)
+            self.process_crime_id(crime_id, table_columns)
 
             elapsed = time.time() - start_time
-            logger.debug(f"[Worker {worker_id}] DONE chunk: {chunk_range} ({elapsed:.2f}s)")
+            logger.debug(f"[Worker {worker_id}] DONE crime_id={crime_id} ({elapsed:.2f}s)")
 
             # Update progress bar
             with progress_lock:
@@ -1550,37 +1613,31 @@ class ArrestsETL:
 
             result_queue.put({
                 'success': True,
-                'chunk': chunk_range,
+                'crime_id': crime_id,
                 'worker_id': worker_id,
                 'elapsed': elapsed
             })
             return True
 
         except Exception as e:
-            logger.error(f"[Worker {worker_id}] ERROR in chunk {chunk_range}: {e}")
+            logger.error(f"[Worker {worker_id}] ERROR in crime_id={crime_id}: {e}")
             logger.error(f"[Worker {worker_id}] Traceback: ", exc_info=True)
 
             result_queue.put({
                 'success': False,
-                'chunk': chunk_range,
+                'crime_id': crime_id,
                 'worker_id': worker_id,
                 'error': str(e)
             })
             return False
 
-    def process_date_ranges_parallel(self, date_ranges: List[Tuple[str, str]], table_columns: Set[str]):
+    def process_crime_ids_parallel(self, crime_ids: List[str], table_columns: Set[str]):
         """
-        Process date ranges in parallel with smart DB pool management.
-
-        Production-grade implementation:
-        - Parallel chunk processing (50-60% faster than sequential)
-        - Monitors DB pool exhaustion
-        - Graceful degradation if pool is near capacity
-        - Comprehensive error handling and recovery
-        - Real-time progress tracking
+        Process crime_ids in parallel with smart DB pool management -- SSOR
+        branch: arrests is driven off crimes, not date-range chunks.
         """
-        num_chunks = len(date_ranges)
-        logger.info(f"⚡ Starting parallel chunk processing ({num_chunks} chunks)")
+        num_crimes = len(crime_ids)
+        logger.info(f"⚡ Starting parallel crime_id processing ({num_crimes} crime_ids)")
         logger.info(f"📊 DB Pool: maxconn={self.db_pool.maxconn}, minconn={self.db_pool.minconn}")
 
         # Determine optimal number of parallel workers
@@ -1597,26 +1654,24 @@ class ArrestsETL:
         progress_lock = threading.Lock()
         progress_dict = {'completed': 0, 'total_time': 0.0}
         result_queue = queue.Queue()
-        failed_chunks = []
-
-        chunk_durations = defaultdict(list)  # Track per-chunk timing
+        failed_crime_ids = []
 
         try:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                # Submit all chunks
+                # Submit all crime_ids
                 futures = {}
-                for idx, (from_date, to_date) in enumerate(date_ranges):
+                for idx, crime_id in enumerate(crime_ids):
                     worker_id = idx % num_workers
                     future = executor.submit(
-                        self._process_chunk_worker,
-                        from_date, to_date, table_columns,
+                        self._process_crime_id_worker,
+                        crime_id, table_columns,
                         result_queue, progress_lock, progress_dict,
                         worker_id
                     )
-                    futures[future] = (from_date, to_date)
+                    futures[future] = crime_id
 
                 # Monitor progress with tqdm
-                with tqdm(total=num_chunks, desc="Processing chunks in parallel", unit="chunk") as pbar:
+                with tqdm(total=num_crimes, desc="Processing crime_ids in parallel", unit="crime") as pbar:
                     completed = 0
                     for future in as_completed(futures):
                         try:
@@ -1625,15 +1680,15 @@ class ArrestsETL:
                             pbar.update(1)
 
                             # Check pool health periodically
-                            if completed % max(1, num_chunks // 10) == 0:
+                            if completed % max(1, num_crimes // 10) == 0:
                                 pool_stats = self.db_pool.stats()
                                 logger.debug(f"[Pool Health] in_use={pool_stats.get('in_use', 'N/A')}, "
                                            f"available={pool_stats.get('available', 'N/A')}, "
-                                           f"progress={completed}/{num_chunks}")
+                                           f"progress={completed}/{num_crimes}")
                         except Exception as e:
-                            logger.error(f"Chunk processing failed: {e}")
-                            from_date, to_date = futures[future]
-                            failed_chunks.append((from_date, to_date, str(e)))
+                            logger.error(f"crime_id processing failed: {e}")
+                            crime_id = futures[future]
+                            failed_crime_ids.append((crime_id, str(e)))
                             pbar.update(1)
 
                 # Collect all results
@@ -1648,37 +1703,37 @@ class ArrestsETL:
                 successful = sum(1 for r in results if r['success'])
                 failed = sum(1 for r in results if not r['success'])
                 total_time = progress_dict['total_time']
-                avg_time_per_chunk = total_time / max(1, successful) if successful > 0 else 0
+                avg_time_per_crime = total_time / max(1, successful) if successful > 0 else 0
 
                 logger.info("")
                 logger.info("=" * 80)
                 logger.info(f"⚡ PARALLEL PROCESSING COMPLETE")
                 logger.info("=" * 80)
-                logger.info(f"✅ Successful chunks: {successful}/{num_chunks}")
-                logger.info(f"❌ Failed chunks: {failed}/{num_chunks}")
+                logger.info(f"✅ Successful crime_ids: {successful}/{num_crimes}")
+                logger.info(f"❌ Failed crime_ids: {failed}/{num_crimes}")
                 logger.info(f"⏱️  Total time: {total_time:.2f}s")
-                logger.info(f"⏱️  Avg per chunk: {avg_time_per_chunk:.2f}s")
+                logger.info(f"⏱️  Avg per crime_id: {avg_time_per_crime:.2f}s")
 
-                if failed_chunks:
-                    logger.warning(f"\n⚠️  {len(failed_chunks)} chunks failed:")
-                    for from_date, to_date, error in failed_chunks[:10]:
-                        logger.warning(f"   - {from_date} to {to_date}: {error}")
-                    if len(failed_chunks) > 10:
-                        logger.warning(f"   ... and {len(failed_chunks) - 10} more")
+                if failed_crime_ids:
+                    logger.warning(f"\n⚠️  {len(failed_crime_ids)} crime_ids failed:")
+                    for crime_id, error in failed_crime_ids[:10]:
+                        logger.warning(f"   - crime_id={crime_id}: {error}")
+                    if len(failed_crime_ids) > 10:
+                        logger.warning(f"   ... and {len(failed_crime_ids) - 10} more")
 
-                    # Attempt retry for failed chunks
-                    logger.info(f"\n🔄 Retrying {len(failed_chunks)} failed chunks sequentially...")
+                    # Attempt retry for failed crime_ids
+                    logger.info(f"\n🔄 Retrying {len(failed_crime_ids)} failed crime_ids sequentially...")
                     retried_success = 0
-                    for from_date, to_date, _ in failed_chunks:
+                    for crime_id, _ in failed_crime_ids:
                         try:
-                            logger.info(f"📅 Retrying: {from_date} to {to_date}")
-                            self.process_date_range(from_date, to_date, table_columns)
+                            logger.info(f"📅 Retrying: crime_id={crime_id}")
+                            self.process_crime_id(crime_id, table_columns)
                             retried_success += 1
                             time.sleep(0.5)  # Be nice to API on retry
                         except Exception as e:
-                            logger.error(f"❌ Retry failed for {from_date} to {to_date}: {e}")
+                            logger.error(f"❌ Retry failed for crime_id={crime_id}: {e}")
 
-                    logger.info(f"✅ Retried {retried_success}/{len(failed_chunks)} chunks successfully")
+                    logger.info(f"✅ Retried {retried_success}/{len(failed_crime_ids)} crime_ids successfully")
 
                 logger.info("=" * 80)
 
@@ -1717,39 +1772,24 @@ class ArrestsETL:
                 logger.warning("FK queue drain failed at startup: %s (non-fatal)", _de)
         
         try:
-            # Get effective start date (check if table has data)
-            effective_start_date = self.get_effective_start_date()
-            logger.info(f"Effective Start Date: {effective_start_date}")
-            
             # Get table columns for schema evolution
             table_columns = self.get_table_columns(ARRESTS_TABLE)
             logger.debug(f"Existing table columns: {sorted(table_columns)}")
-            
-            # Generate date ranges with overlap to ensure no data is missed
-            date_ranges = self.generate_date_ranges(
-                effective_start_date,
-                calculated_end_date,
-                ETL_CONFIG['chunk_days'],
-                ETL_CONFIG.get('chunk_overlap_days', 1)  # Default to 1 day overlap for safety
-            )
-            
-            logger.info(f"Date Range: {effective_start_date} to {calculated_end_date}")
-            overlap_days = ETL_CONFIG.get('chunk_overlap_days', 1)
-            logger.info(f"Chunk Size: {ETL_CONFIG['chunk_days']} days (overlap: {overlap_days} day(s) to ensure no data loss)")
+
+            # SSOR branch: arrests is driven off crime_ids already in
+            # crimes (GET /arrests/{crimeId}), not an independent
+            # date-range scan -- resumability comes from pending_crime_ids'
+            # NOT EXISTS check, not a date checkpoint.
+            with self.db_pool.get_connection_context() as conn:
+                with conn.cursor() as cursor:
+                    crime_ids = self.pending_crime_ids(cursor)
+
+            logger.info(f"📊 Found {len(crime_ids)} crime_ids pending arrests fetch")
             logger.info("=" * 80)
-            
-            logger.info(f"📊 Total date ranges to process: {len(date_ranges)}")
-            logger.trace(f"Generated date ranges: {date_ranges[:5]}{'...' if len(date_ranges) > 5 else ''} (showing first 5)")
-            logger.info("")
-            start_dt = parse_iso_date(effective_start_date)
-            end_dt = parse_iso_date(calculated_end_date)
-            logger.info(f"ℹ️  API Server Timezone: IST (UTC+05:30)")
-            logger.info(f"ℹ️  Date Range: {format_iso_date(start_dt)} to {format_iso_date(end_dt)}")
-            logger.info(f"ℹ️  ETL Server Timezone: UTC")
             logger.info("")
 
-            # Process date ranges with parallel chunk processing (production-grade)
-            self.process_date_ranges_parallel(date_ranges, table_columns)
+            # Process crime_ids with parallel processing (production-grade)
+            self.process_crime_ids_parallel(crime_ids, table_columns)
             
             # Get database counts
             with self.db_pool.get_connection_context() as conn:
